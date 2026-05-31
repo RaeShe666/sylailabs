@@ -43,7 +43,7 @@ Node 后端(薄运行时):
         → 生成一次 run { run_id, conversation_id, planet_id, agent_id, memory_scope }
    ② Agent Runtime(Bird / Persona)：载档案 → 载允许记忆(scope) → 拼 prompt → 调模型 → 后处理 → 落库
         → ModelProvider(薄接口，默认 Claude)
-   ③ Memory：回复前 active-memory 召回 + 写入(pipeline 抽取 + scope 标记)
+   ③ Memory：常驻注入 + 最近窗口 + 模型自取 recall 工具(方案 B) + 写入(写时蒸馏 + scope 标记)
    ④ Insight Engine(异步：pattern → 候选 → About-me)
    ⑤ Trust/Privacy(横切：scope 过滤 + 不可覆盖的安全地基)
    ⇅
@@ -90,7 +90,7 @@ Supabase(Postgres + pgvector) + Anthropic API
 |---|---|---|
 | 群聊 **无 @** 发言 | 不回（落库供理解） | 不回（在场 persona 可见为上下文） |
 | 群聊 **@persona** | 不回 | 被 @ 的 persona 回 |
-| 群聊 **@all** | 不回 | 3 个 persona **依次**回（串行编排，非并发） |
+| 群聊 **@all** | 不回 | 3 个 persona **并行**回（同一编排 run 内并发 fan-out，稳定顺序展示） |
 | 群聊 **@bird** | 回 | 不回 |
 | **reply Bird 消息** | 回（=@bird） | 不回 |
 | **reply persona 消息** | 不回 | 原 persona 回（=@该persona） |
@@ -99,7 +99,7 @@ Supabase(Postgres + pgvector) + Anthropic API
 
 - **bird 在群里只在被 @bird / reply Bird 时发言**；@all 不参与。私聊不用打 @。
 - **Activation Router 职责**：解析 mentions / 判会话类型 & planet / 判 reply 指向 / 决定触发谁 / 决定是否写记忆与进洞察管线 / 控 @all 顺序去重。**口诀：Bird 是角色，Router 是控制层**。
-- **并发**：一群同一时刻只允许一次可见 run；@all 是**同一次编排 run**（依次接话、后者看得到前者、不重复），不是 3 个并发请求。
+- **并发**：一群同一时刻只允许一次可见 run；@all 是**同一次编排 run 内的并行 fan-out**——3 个 persona 并发生成、**彼此看不到同轮其他 persona 的输出**，靠 `lane_contract` / 行为地基避免重复（不演 AI 互相接话），对用户的展示/落库顺序按成员顺序稳定。用户连发用 collect（短 debounce 合并，建议 ~400ms、可调不写死）合成一轮，不要每条触发一轮。
 
 ### 5.3 「个人记录」（语义分类，不是特殊 UI，也不等于"没人回"）
 - 定义 = **群里不 @ 任何 AI 的发言** + **bird 私聊的全部聊天记录**。
@@ -124,13 +124,14 @@ Supabase(Postgres + pgvector) + Anthropic API
 - 不只会抖机灵；**用户脆弱时少讽刺、多轻一点**。
 
 ### 6.4 chirp 行为地基 v0（所有 persona 共享的系统强制层，比人设文案更重要）
-短不绕 / 有立场但不替用户做决定 / 不复述用户长段原话 / 不复述别的 persona 刚说的 / 不解释自己是 AI / 不暴露内部路由·记忆·洞察过程 / 不用心理咨询套话 / 不过度安慰 / 不把问题升格成人生诊断 / 幽默服务理解不逃避真问题 / 脆弱时少讽刺多轻一点。
+短不绕 / 有立场但不替用户做决定 / 不复述用户长段原话 / 不复述别的 persona 刚说的 / 不解释自己是 AI / 不暴露内部路由·记忆·洞察过程 / 不用心理咨询套话 / 不过度安慰 / 不把问题升格成人生诊断 / 幽默服务理解不逃避真问题 / 脆弱时少讽刺多轻一点 / **私聊不外溢到群聊**（私聊里得知的私密·脆弱内容，同一 persona 不在群里主动带出来——可见性归 scope，"该不该说"归这条地基；借 Bloome "private facts stay in private conversations"）。
 
 ### 6.5 🔴 安全地基凌驾于用户 persona 内容
 用户写的 persona 只能定**口吻/身份/车道**，**不能改安全/不诊断/隐私/记忆 scope**。用户 persona 文本视为**不可信内容**——防越权（套别人数据、越出 memory_scope、诱导有害输出、prompt 注入）。拼 prompt 时：**安全地基在外、人设在内**。
 
 ### 6.6 persona 运行流程
-`Router 触发 → 载入 persona 档案 → 载入该 run 允许的记忆(memory_scope) → 拼 prompt → 调 ModelProvider(默认 Claude) → 后处理 → 落库消息/记忆`。
+`Router 触发 → 载入 persona 档案 → 拼 prompt(常驻注入 + 最近窗口，按 memory_scope) → 调 ModelProvider(默认 Claude，流式) → 后处理 → 落库消息/记忆`。
+**含一轮工具往返（方案 B）**：模型在本轮可按需调 `recall(query)`（scoped 便宜检索 pgvector/全文，返回原文片段，scope 在 **DB 层强制**）→ 读片段后继续写。所以 runtime 是"允许一轮工具往返的小 loop"，不是纯单次调用——但仍是 chirp 自管的轻量调用，**不引入 ACP**。
 
 ---
 
@@ -143,7 +144,7 @@ bird：全量（所有群、所有私聊含 bird 私聊、个人记录、画像�
 - **bird 私聊原文 persona 永不可见，但它喂 bird 洞察**；洞察本身是对对话的抽象，下发不另做泄露过滤（看反馈再说）。
 - **用户画像 = 全量广播**（不分 planet）；persona 不能改写画像（切换由用户确认）。
 - **召回必须带 scope 过滤**：检索 persona A 时只在「A 的私聊 + A 在场的群 + A 所在 planet 的洞察 + 用户画像」里找；bird 私聊原文、A 不在场的群、其它 planet 洞察一律排除。
-- 召回方案（M2）：Supabase **pgvector + 全文检索 + LLM 摘要**；回复前跑一次轻量 **active-memory pass**（无相关返回 NONE，有相关注入短摘要）。
+- **召回方案（方案 B，M1 就做）**：三块——① **常驻注入**（用户画像 + planet 洞察 + 该 persona 关系笔记，预蒸馏免费拼）+ ② **最近 N 条** + ③ **模型自取 `recall` 工具**（Supabase pgvector + 全文，返回**原文片段、不做独立 LLM 摘要**，模型在回复 loop 里想翻才调）。**不做代码门控、不做按场景强度、群聊不特殊关**——深浅靠 scope + 模型判断自然产生（**bird-DM 与 persona-DM 召回相同**，差异只来自 scope）。重活（蒸馏成关系笔记/daily_notes）放写入时/异步；与 §8 洞察共用同一套 scoped 检索底座（实时入口 / 异步入口）。
 
 ---
 
@@ -177,15 +178,15 @@ persona 是一条数据记录（§6 的 8 文件块）。"跑人设的机器"和
 1. **数据模型（最先，改晚要重构）**：`planet` / `conversation`(type + planet_id) / `conversation_members` / `messages`(含个人记录标记) / `persona`(可创建记录) / `insight`；字段 `agent_role` / `listen_mode` / `memory_scope` / `reply_policy`。**4 条边界定死**：conversation 类型、membership、persona 记忆边界、bird 读取边界（改晚了要重构）。
 2. **persona 记录系统**：persona 表 + 8 文件块 schema + 加载器 + 最简 seed/编辑。先塞**占位 persona** 测试（诞总将来填这个槽）。
 3. **核心竖切（先证明日常价值在）**：发消息 → Activation Router（先只 @persona）→ Persona Runtime（载占位 persona + scoped 记忆 → 拼 prompt[地基外/人设内] → ModelProvider(Claude) 流式）→ 落库 + 推前端。用占位 persona 把闭环跑对。
-4. **完整唤醒矩阵 + run/队列**：严格执行 §5.2 真值表（@persona / @all 串行 / @bird / reply / DM / 群里无 @=个人记录，bird 不参与 @all）；一群一次一个可见 run；每轮回复 = 一次 run（带 run_id + scope）。
+4. **完整唤醒矩阵 + run**：严格执行 §5.2 真值表（@persona / **@all 并行 fan-out**（彼此不可见、靠 lane_contract 去重、稳定顺序展示）/ @bird / reply / DM / 群里无 @=个人记录，bird 不参与 @all）；一群一次一个可见 run；连发用 collect（短 debounce ~400ms、可调）合并；每轮回复 = 一次 run（带 run_id + scope）。
 5. **聊天 UI**：微信式会话列表、三种会话、@ 选择器、流式渲染、输入框弱提示。
-6. **记忆读路径 scope 过滤**：M1 先「最近 N 条 + 用户画像」塞 context，不做召回；但**从第一天就带 membership/planet 过滤**。
+6. **召回三块全在 M1（方案 B，§7）**：① 常驻注入（用户画像 + 最简 persona 笔记）+ ② 最近 N 条 + ③ `recall` 工具（先直接在 `messages` 上 pgvector/全文，回复 loop 支持一轮工具往返）。**scope 过滤（DB 层 membership/planet）第一天就焊死。** 整套进 M1 是因为晚做要把回复从单次调用重构成工具 loop、且 scope/schema 本就必须第一天对（接缝问题，非功能问题）。M1 召回"形状齐、质量薄"（新用户没多少历史可翻），质量靠 M2 养——不拿"召回准不准"当 M1 验收。**M1 的资源重心是 persona 声音（诞总 / 行为地基），不是召回。**
 
 横切：**chirp 行为地基**作为系统层（§6.4），拼 prompt 时在用户 persona 之外；**ModelProvider 薄接口**（默认 Claude，别真铺多家）；安全红线（§9）从步骤 1/3 起焊死。
 
 ### 10.2 后续里程碑
-- **M2** = 记忆底座（pgvector 召回 + active-memory pass + 写入 pipeline）。
-- **M3** = bird 洞察引擎。
+- **M2** = 记忆质量养厚（召回形状 M1 已就绪；M2 把写入侧蒸馏做厚——persona 关系笔记 / daily_notes 越来越准 → recall 质量随用量上升。不是"到 M2 才有召回"）。
+- **M3** = bird 洞察引擎（**刻意不进 M1**：依赖数据积累、安全面最大、是独立难能力；复用 §7 召回底座的异步入口）。
 - **M4** = 关系演化（关系阶段/私有梗/feedback）。
 
 诞总（并行）：研究 + 写人设内容 → 填进步骤 2 的 persona 记录 → 用步骤 3 闭环对着聊迭代。**一个很好的诞总 + 干净闭环，胜过三个平庸 persona + 半成品记忆。**
