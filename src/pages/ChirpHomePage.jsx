@@ -1,6 +1,8 @@
-﻿import { useEffect, useMemo, useRef, useState } from 'react'
+﻿import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import ChirpPage from './ChirpPage'
+import PersonaTestPage from './PersonaTestPage'
+import PersonaProfilePage from './PersonaProfilePage'
 import {
   addPersonaToPlanet,
   BIRD,
@@ -9,33 +11,44 @@ import {
   formatActivityTime,
   getAllPlanets,
   getAllPersonas,
+  getPersonasForPlanet,
+  UserAvatar,
   getPlanetById,
   getPlanetRecent,
   getPersonaTheme,
   PersonaAvatar,
   readPlanetActivity,
   saveCustomPersona,
+  savePlanetMeta,
   truncateTitle
 } from './chirpShared'
 import {
   loadChirpPlanets,
   loadChirpProfile,
-  loadChirpMomentAiEntries,
   loadChirpMomentEntries,
+  loadChirpDmConversations,
   loadCustomPersonas,
   loadPlanetActivityFromMessages,
   loadPlanetMemberPersonas,
   saveChirpProfile,
-  saveChirpMomentAiEntry,
   saveChirpMomentEntry,
   saveCustomPersonaToSupabase,
   savePlanetMemberPersonas,
+  updateChirpPlanet,
   uploadPersonaAvatar
 } from './chirpSupabase'
 import './ChirpHomePage.css'
 
 const navigateTo = (...segments) => {
   window.location.hash = '/' + segments.filter(Boolean).join('/')
+}
+
+const mergePersonas = (...groups) => {
+  const byId = new Map()
+  groups.flat().filter(Boolean).forEach(persona => {
+    byId.set(persona.id, { ...(byId.get(persona.id) || {}), ...persona })
+  })
+  return [...byId.values()]
 }
 
 const HomeBird = () => (
@@ -106,10 +119,12 @@ const planetArt = {
 }
 
 const getCardTitle = (planet) => (planet.id === 'work' ? 'the suck odessy' : 'my crush...')
-const getPlanetCardTitle = (planet) => planet.cardTitle || getCardTitle(planet)
-const DRAWER_MIN_WIDTH = 260
-const DRAWER_DEFAULT_WIDTH = 300
-const DRAWER_MAX_WIDTH = 340
+// Planet (folder) display name. The group chat name is a separate field.
+const getPlanetCardTitle = (planet) => planet.roomName || planet.cardTitle || getCardTitle(planet)
+const getGroupName = (planet) => planet.groupName || planet.roomName || getPlanetCardTitle(planet)
+const DRAWER_MIN_WIDTH = 264
+const DRAWER_DEFAULT_WIDTH = 264   // default = min: the width the user opens at
+const DRAWER_MAX_WIDTH = 360
 
 const rgbToHex = (r, g, b) => (
   `#${[r, g, b].map(value => Math.round(value).toString(16).padStart(2, '0')).join('')}`
@@ -168,10 +183,9 @@ const getPersonaThemeStyle = (persona) => {
 const DEFAULT_PERSONA_COLOR = '#DCC4EA'
 const PERSONA_AVATAR_COLORS = [DEFAULT_PERSONA_COLOR, '#EBA7B5', '#A9C9DF', '#A9CDA0', '#F5C878', '#F0A48A', '#9DC7B5']
 const PERSONA_DESCRIPTION_ZH = {
-  lovebrain: '温暖但敏锐的情绪雷达，帮助你读懂暧昧与不确定，而不是把每一次简短回复都判成结局。',
-  strategist: '拆分事实、假设、证据和下一步，适合需要理清关系或工作局面的时刻。',
-  owl: '一个更慢的声音，观察边界与节奏，也照顾那个在建议之前更需要一个问题的你。',
-  rabbit: '在你需要先安顿情绪、再分析发生了什么时，提供温柔的落点。'
+  danzong: '解构、松弛、反鸡汤，先把过度用力的解释拆薄一点。',
+  barry: '先接住情绪，再帮你把脑内小剧场调低一点音量。',
+  duck: '拆分事实、假设、证据和下一步，适合需要理清关系局面的时刻。'
 }
 
 const localizeActivityTime = (time, isChinese) => {
@@ -358,6 +372,7 @@ function ChirpHomePage({ page, id, language = 'en' }) {
   const [planetActivity, setPlanetActivity] = useState(() => readPlanetActivity())
   const [planets, setPlanets] = useState(() => getAllPlanets())
   const [personas, setPersonas] = useState(() => getAllPersonas())
+  const [dmConversations, setDmConversations] = useState([])
   const [onboardingOpen, setOnboardingOpen] = useState(false)
   const [chirpProfile, setChirpProfile] = useState(() => readOnboardingProfile())
   const [profileResolved, setProfileResolved] = useState(false)
@@ -367,6 +382,25 @@ function ChirpHomePage({ page, id, language = 'en' }) {
   }, [page, id, planets])
 
   const recentFor = (planet) => planetActivity[planet.id] || getPlanetRecent(planet)
+
+  // Rename the PLANET (folder) — writes roomName to local meta (fires
+  // chirp:planet-meta-updated → every planet-name display refreshes) and to the
+  // DB. Does NOT touch the group name (that's a separate field).
+  const renamePlanet = (planet, newName) => {
+    savePlanetMeta(planet.id, { roomName: newName, cardTitle: newName })
+    updateChirpPlanet(planet, { roomName: newName }).catch(error => console.warn('Failed to rename planet:', error))
+  }
+
+  // The user's persona DMs power the persistent conversation list. Refresh when
+  // the route changes so a brand-new DM shows up after the first message.
+  useEffect(() => {
+    if (!user) { setDmConversations([]); return }
+    let alive = true
+    loadChirpDmConversations(user)
+      .then(list => { if (alive) setDmConversations(list) })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [user, page, id])
 
   const openPlanetDrawer = () => {
     setDrawerMode('planets')
@@ -463,7 +497,7 @@ function ChirpHomePage({ page, id, language = 'en' }) {
         ])
         if (cancelled) return
         setPlanets(remotePlanets)
-        setPersonas([...getAllPersonas(), ...remoteCustomPersonas])
+        setPersonas(mergePersonas(getAllPersonas(), remoteCustomPersonas))
         const remoteActivity = await loadPlanetActivityFromMessages(remotePlanets)
         if (!cancelled) setPlanetActivity(remoteActivity)
       } catch (error) {
@@ -499,9 +533,11 @@ function ChirpHomePage({ page, id, language = 'en' }) {
 
   if (selectedPlanet) {
     return (
-      <div className="chirp-home-detail">
-        <ChirpPage planetConfig={selectedPlanet} onBack={openPlanetDrawer} language={language} />
-        <SideDrawer open={drawerOpen} mode={drawerMode} setMode={setDrawerMode} onClose={() => setDrawerOpen(false)} recentFor={recentFor} planets={planets} drawerWidth={drawerWidth} onResizeStart={startDrawerResize} language={language} />
+      <div className="chirp-home-detail chirp-two-pane">
+        <SideDrawer docked planets={planets} recentFor={recentFor} language={language} activePlanetId={selectedPlanet.id} dmConversations={dmConversations} personas={personas} drawerWidth={drawerWidth} onResizeStart={startDrawerResize} onClose={() => {}} onCreatePlanet={() => setOnboardingOpen(true)} onCreatePersona={() => navigateTo('chirp', 'persona')} onRenamePlanet={renamePlanet} />
+        <div className="chirp-pane-main">
+          <ChirpPage planetConfig={selectedPlanet} language={language} onOpenPersona={(personaId) => navigateTo('chirp', 'persona-profile', personaId)} />
+        </div>
         {onboardingOpen && <ChirpOnboarding onComplete={completeOnboarding} language={language} />}
       </div>
     )
@@ -512,9 +548,60 @@ function ChirpHomePage({ page, id, language = 'en' }) {
       <div className="chirp-home-page">
         <PersonaPage personas={personas} planets={planets} user={user} language={language} onPersonasChange={async () => {
           const remoteCustomPersonas = user ? await loadCustomPersonas(user).catch(() => []) : []
-          setPersonas([...getAllPersonas(), ...remoteCustomPersonas])
+          setPersonas(mergePersonas(getAllPersonas(), remoteCustomPersonas))
         }} />
         <SideDrawer open={drawerOpen} mode={drawerMode} setMode={setDrawerMode} onClose={() => setDrawerOpen(false)} recentFor={recentFor} planets={planets} drawerWidth={drawerWidth} onResizeStart={startDrawerResize} language={language} />
+        {onboardingOpen && <ChirpOnboarding onComplete={completeOnboarding} language={language} />}
+      </div>
+    )
+  }
+
+  if (page === 'persona-profile') {
+    const profilePersona = personas.find(persona => persona.id === id)
+    return (
+      <div className="chirp-home-detail">
+        <PersonaProfilePage
+          persona={profilePersona}
+          language={language}
+          onBack={() => window.history.back()}
+          onMessage={(personaId) => navigateTo('chirp', 'persona-dm', personaId)}
+        />
+        <SideDrawer open={drawerOpen} mode={drawerMode} setMode={setDrawerMode} onClose={() => setDrawerOpen(false)} recentFor={recentFor} planets={planets} drawerWidth={drawerWidth} onResizeStart={startDrawerResize} language={language} />
+        {onboardingOpen && <ChirpOnboarding onComplete={completeOnboarding} language={language} />}
+      </div>
+    )
+  }
+
+  if (page === 'persona-dm') {
+    const dmPersona = personas.find(persona => persona.id === id)
+    return (
+      <div className="chirp-home-detail chirp-two-pane">
+        <SideDrawer docked planets={planets} recentFor={recentFor} language={language} activePlanetId={null} activeDmAgentId={id} dmConversations={dmConversations} personas={personas} drawerWidth={drawerWidth} onResizeStart={startDrawerResize} onClose={() => {}} onCreatePlanet={() => setOnboardingOpen(true)} onCreatePersona={() => navigateTo('chirp', 'persona')} onRenamePlanet={renamePlanet} />
+        <div className="chirp-pane-main">
+          <ChirpPage dmAgent={dmPersona} dmConversationId={dmConversations.find(dm => dm.agentId === id)?.conversationId || null} language={language} onBack={() => window.history.back()} onDmStarted={() => user && loadChirpDmConversations(user).then(setDmConversations).catch(() => {})} />
+        </div>
+        {onboardingOpen && <ChirpOnboarding onComplete={completeOnboarding} language={language} />}
+      </div>
+    )
+  }
+
+  if (page === 'persona-test') {
+    return (
+      <div className="chirp-home-detail">
+        <PersonaTestPage personaId={id || 'danzong'} language={language} onBack={() => navigateTo('chirp', 'persona')} />
+        <SideDrawer open={drawerOpen} mode={drawerMode} setMode={setDrawerMode} onClose={() => setDrawerOpen(false)} recentFor={recentFor} planets={planets} drawerWidth={drawerWidth} onResizeStart={startDrawerResize} language={language} />
+        {onboardingOpen && <ChirpOnboarding onComplete={completeOnboarding} language={language} />}
+      </div>
+    )
+  }
+
+  if (page === 'dm') {
+    return (
+      <div className="chirp-home-detail chirp-two-pane">
+        <SideDrawer docked planets={planets} recentFor={recentFor} language={language} activePlanetId={null} activeDmAgentId="bird" dmConversations={dmConversations} personas={personas} drawerWidth={drawerWidth} onResizeStart={startDrawerResize} onClose={() => {}} onCreatePlanet={() => setOnboardingOpen(true)} onCreatePersona={() => navigateTo('chirp', 'persona')} onRenamePlanet={renamePlanet} />
+        <div className="chirp-pane-main">
+          <ChirpPage dmAgent={BIRD} dmConversationId={dmConversations.find(dm => dm.agentId === 'bird')?.conversationId || null} language={language} />
+        </div>
         {onboardingOpen && <ChirpOnboarding onComplete={completeOnboarding} language={language} />}
       </div>
     )
@@ -672,13 +759,6 @@ const MOMENT_SPACES = [
     className: 'love',
     title: 'X & W',
     subtitle: 'SHARED'
-  },
-  {
-    id: 'inner-child',
-    backingId: 'work',
-    className: 'work',
-    title: 'the inner child',
-    subtitle: 'PRIVATE'
   }
 ]
 
@@ -690,24 +770,7 @@ const MOMENT_SAMPLE_ENTRIES = {
     { id: 'sample-xw-3', dateKey: 'yesterday', dateLabel: 'Yesterday', time: '10 : 30 · W', tone: 'fr', text: '早上阳光洒进来，突然很想发条消息给你。又忍住了。' },
     { id: 'sample-xw-2', dateKey: 'today', dateLabel: 'Today', time: '14 : 22 · X', tone: 'me', text: '路过咖啡店，门口的猫又在晒太阳。跟你说过的那只。', image: 'cat', imageText: '🐱 cat in the sun' },
     { id: 'sample-xw-1', dateKey: 'today', dateLabel: 'Today', time: '15 : 08 · W', tone: 'fr', text: '中午那个汤！！好喝到原地升天，下次一起去', image: 'soup', imageText: '🍲 那家小店' }
-  ],
-  'inner-child': [
-    { id: 'sample-inner-5', dateKey: 'may-10', dateLabel: 'May 10', time: '21 : 08 · S', tone: 'me', text: '看完动画片莫名想哭。是被那种“很简单的好”打到了。' },
-    { id: 'sample-inner-4', dateKey: 'may-12', dateLabel: 'May 12', time: '12 : 15 · S', tone: 'me', text: '午饭吃了碗特别好吃的牛肉面。幸福就是这么简单。' },
-    { id: 'sample-inner-6', dateKey: 'yesterday', dateLabel: 'Yesterday', time: '22 : 18 · S', tone: 'me', text: '睡前突然想到，今天其实已经比昨天更像自己一点。' },
-    { id: 'sample-inner-3', dateKey: 'yesterday', dateLabel: 'Yesterday', time: '09 : 48 · S', tone: 'me', text: '碎碎念：今天的云像被揉皱的纸巾，但看着很安心。' },
-    { id: 'sample-inner-2', dateKey: 'today', dateLabel: 'Today', time: '13 : 27 · S', tone: 'me', text: '灵机一现：下次写东西可以先写标题，别急着证明自己很完整。' },
-    { id: 'sample-inner-1', dateKey: 'today', dateLabel: 'Today', time: '16 : 12 · S', tone: 'me', text: '刚刚买到最后一只草莓面包，像被今天偷偷偏爱了一下。' }
   ]
-}
-
-const MOMENTS_BIRD_PROMPT = {
-  id: 'bird-inner-child-prompt',
-  dateKey: 'bird-today',
-  dateLabel: 'Today',
-  time: '小草 · now',
-  tone: 'bird',
-  text: '我会在这里陪你把零散的感受慢慢写清楚。你不用组织好再说，我会先问很简单的问题：你今天心情如何？'
 }
 
 const readLocalMomentEntries = (planetId) => {
@@ -758,7 +821,6 @@ function MomentsCalendarDay({ kind, day, today, onOpen }) {
 }
 
 function MomentsPage({ user, getAccessToken, planets }) {
-  const [aiMode, setAiMode] = useState(false)
   const [calendarOpen, setCalendarOpen] = useState(false)
   const [bgPickerOpen, setBgPickerOpen] = useState(false)
   const [paperColor, setPaperColor] = useState('#FAFAF7')
@@ -770,11 +832,8 @@ function MomentsPage({ user, getAccessToken, planets }) {
   const [saving, setSaving] = useState(false)
   const [savedAt, setSavedAt] = useState(null)
   const [draftEntryId, setDraftEntryId] = useState(null)
-  const [aiEntries, setAiEntries] = useState([])
-  const [aiThinking, setAiThinking] = useState(false)
   const memoScrollRef = useRef(null)
   const composerRef = useRef(null)
-  const lastAiRequestRef = useRef('')
 
   const activeMoment = useMemo(() => {
     return MOMENT_SPACES.find(space => space.id === activeMomentId) || MOMENT_SPACES[0]
@@ -790,20 +849,15 @@ function MomentsPage({ user, getAccessToken, planets }) {
       const localEntries = readLocalMomentEntries(activeMomentId)
       if (!user || !backingPlanet?.dbId) {
         setMomentEntries(localEntries)
-        if (activeMomentId !== 'inner-child') setAiEntries([])
         setDraftText('')
         setDraftEntryId(null)
         return
       }
       try {
         const remoteEntries = await loadChirpMomentEntries(backingPlanet, activeMomentId)
-        const remoteAiEntries = activeMomentId === 'inner-child'
-          ? await loadChirpMomentAiEntries(backingPlanet, activeMomentId)
-          : []
         const entries = remoteEntries?.length ? remoteEntries : localEntries
         if (!cancelled) {
           setMomentEntries(entries)
-          setAiEntries(remoteAiEntries || [])
           setDraftText('')
           setDraftEntryId(null)
         }
@@ -811,7 +865,6 @@ function MomentsPage({ user, getAccessToken, planets }) {
         console.warn('Failed to load Moments entries:', error)
         if (!cancelled) {
           setMomentEntries(localEntries)
-          if (activeMomentId !== 'inner-child') setAiEntries([])
           setDraftText('')
           setDraftEntryId(null)
         }
@@ -841,7 +894,6 @@ function MomentsPage({ user, getAccessToken, planets }) {
       saveLocalMomentEntries(activeMomentId, nextEntries)
       setSavedAt(Date.now())
       window.dispatchEvent(new CustomEvent('chirp:planet-activity'))
-      requestMomentAiReply(text, nextEntries)
     } catch (error) {
       console.warn('Failed to save Moment entry:', error)
       const restEntries = momentEntries.filter(entry => entry.id !== draftEntryId && entry.id !== localEntry.id)
@@ -850,7 +902,6 @@ function MomentsPage({ user, getAccessToken, planets }) {
       setDraftEntryId(localEntry.id)
       saveLocalMomentEntries(activeMomentId, nextEntries)
       setSavedAt(Date.now())
-      requestMomentAiReply(text, nextEntries)
     } finally {
       setSaving(false)
     }
@@ -886,111 +937,11 @@ function MomentsPage({ user, getAccessToken, planets }) {
   }, [activeMomentId, momentEntries.length, calendarOpen, composerActive])
 
   useEffect(() => {
-    if (activeMomentId !== 'inner-child' && aiMode) setAiMode(false)
-  }, [activeMomentId, aiMode])
-
-  useEffect(() => {
-    if (activeMomentId !== 'inner-child') {
-      setAiEntries([])
-      lastAiRequestRef.current = ''
-    }
-  }, [activeMomentId])
-
-  useEffect(() => {
     setComposerActive(false)
     setDraftText('')
     setDraftEntryId(null)
     if (composerRef.current) composerRef.current.textContent = ''
   }, [activeMomentId])
-
-  const requestMomentAiReply = async (text, entriesContext = momentEntries) => {
-    const trimmed = text.trim()
-    if (!trimmed || trimmed.length < 4) return
-    if (!aiMode || activeMomentId !== 'inner-child') return
-    if (lastAiRequestRef.current === trimmed) return
-    lastAiRequestRef.current = trimmed
-
-    const isLocalHost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-    const apiBase = import.meta.env.VITE_API_URL || (isLocalHost ? 'http://localhost:8080' : '')
-    const token = getAccessToken ? await getAccessToken() : null
-    const headers = { 'Content-Type': 'application/json' }
-    if (token) headers.Authorization = `Bearer ${token}`
-
-    setAiThinking(true)
-    try {
-      const contextMessages = [
-        ...entriesContext.slice(-8).map(entry => ({ type: 'memo', text: entry.text })),
-        ...aiEntries.slice(-4).map(entry => ({ type: 'agent', agentId: 'bird', text: entry.text })),
-        { type: 'user', text: trimmed }
-      ]
-      const response = await fetch(`${apiBase}/api/chirp/reply`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          planet: {
-            id: 'moments-inner-child',
-            name: 'the inner child',
-            type: 'private moment',
-            tone: 'private reflective writing',
-            recentUserMessage: trimmed
-          },
-          user: { nickname: 'S', avatar: 'S' },
-          agent: {
-            id: 'bird',
-            name: '小草',
-            role: 'Moment writing companion',
-            description: '小草 helps the user keep writing by asking one grounded follow-up question.',
-            systemPrompt: 'You are 小草 inside Chirp Moments. The user has turned on AI Mode, which means you are allowed to read this private Moment and help them keep writing. Reply in the user language. Ask exactly one gentle, concrete follow-up question unless a very short reflection is more useful. Do not mention Planet. Do not summarize everything. Max 1-2 short sentences.'
-          },
-          members: [{ id: 'bird', name: '小草', role: 'Moment writing companion' }],
-          messages: contextMessages
-        })
-      })
-      if (!response.ok) throw new Error(`Moment AI request failed: ${response.status}`)
-      const data = await response.json()
-      const replyText = data?.reply?.text?.trim()
-      if (!replyText) return
-      let replyEntry = {
-        id: `bird-${Date.now()}`,
-        createdAt: Date.now(),
-        time: '小草 · now',
-        text: replyText
-      }
-      if (user && backingPlanet?.dbId) {
-        replyEntry = await saveChirpMomentAiEntry(backingPlanet, replyText, activeMomentId) || replyEntry
-      }
-      setAiEntries(prev => [...prev, replyEntry])
-    } catch (error) {
-      console.warn('Failed to request Moment AI reply:', error)
-    } finally {
-      setAiThinking(false)
-    }
-  }
-
-  const toggleAiMode = () => {
-    if (activeMomentId !== 'inner-child') return
-    const next = !aiMode
-    setAiMode(next)
-    if (next && !aiEntries.length) {
-      const promptEntry = {
-        id: MOMENTS_BIRD_PROMPT.id,
-        createdAt: Date.now(),
-        time: MOMENTS_BIRD_PROMPT.time,
-        text: MOMENTS_BIRD_PROMPT.text
-      }
-      setAiEntries([promptEntry])
-      if (user && backingPlanet?.dbId) {
-        saveChirpMomentAiEntry(backingPlanet, MOMENTS_BIRD_PROMPT.text, activeMomentId)
-          .then(savedEntry => {
-            if (!savedEntry) return
-            setAiEntries(prev => prev.map(entry => (
-              entry.id === MOMENTS_BIRD_PROMPT.id ? savedEntry : entry
-            )))
-          })
-          .catch(error => console.warn('Failed to save Moment AI prompt:', error))
-      }
-    }
-  }
 
   const jumpToMomentDate = (month, day) => {
     const target = MOMENTS_DATE_TARGETS[month]?.[day] || 'today'
@@ -1030,10 +981,10 @@ function MomentsPage({ user, getAccessToken, planets }) {
   }, [activeMomentId])
 
   const todayEntries = useMemo(() => {
-    const userEntries = momentEntries.map(entry => ({ ...entry, source: 'me' }))
-    const birdEntries = activeMomentId === 'inner-child' ? aiEntries.map(entry => ({ ...entry, source: 'bird' })) : []
-    return [...userEntries, ...birdEntries].sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))
-  }, [activeMomentId, aiEntries, momentEntries])
+    return momentEntries
+      .map(entry => ({ ...entry, source: 'me' }))
+      .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))
+  }, [momentEntries])
 
   return (
     <main className="chirp-moments-page">
@@ -1069,12 +1020,6 @@ function MomentsPage({ user, getAccessToken, planets }) {
           <div className="moments-m-center">
             <button className="moments-m-tool" type="button" title="Attach"><MomentsPaperclipIcon /></button>
             <button className="moments-m-tool" type="button" title="Voice"><MomentsMicIcon /></button>
-            {activeMomentId === 'inner-child' && (
-              <button className={`moments-m-aimode ${aiMode ? 'on' : ''}`} type="button" onClick={toggleAiMode}>
-                <span>AI Mode</span>
-                <span className="moments-ai-switch" />
-              </button>
-            )}
           </div>
 
           <div className="moments-m-right">
@@ -1108,12 +1053,6 @@ function MomentsPage({ user, getAccessToken, planets }) {
                     <div className={`moments-entry-text ${entry.source === 'bird' ? 'bird' : 'me'}`} lang={/[\u4e00-\u9fff]/.test(entry.text) ? 'zh' : 'en'}>{entry.text}</div>
                   </div>
                 ))}
-                {section.key === 'today' && aiThinking && (
-                  <div className="moments-entry moments-bird-entry">
-                    <div className="moments-entry-time">小草 · now</div>
-                    <div className="moments-entry-text bird" lang="zh">我在看你刚写下来的这一句。</div>
-                  </div>
-                )}
               </section>
             ))}
 
@@ -1474,6 +1413,7 @@ function PersonaPage({ personas, planets, user, onPersonasChange, language }) {
             <p>{isChinese && PERSONA_DESCRIPTION_ZH[persona.id] ? PERSONA_DESCRIPTION_ZH[persona.id] : persona.description}</p>
             <div className="persona-card-foot">
               <span>{isChinese ? `${persona.usageCount || 0} 个使用中` : `${persona.usageCount || 0} in use`}</span>
+              <button type="button" onClick={() => navigateTo('chirp', 'persona-test', persona.id)}>{isChinese ? '测试' : 'Test'}</button>
               <button type="button" onClick={() => setUsePersona(persona)}>{isChinese ? '使用' : 'Use'}</button>
             </div>
           </article>
@@ -1565,19 +1505,31 @@ function PersonaPage({ personas, planets, user, onPersonasChange, language }) {
   )
 }
 
-function DrawerPlanetCard({ planet, onClick, recent, language }) {
+function DrawerPlanetCard({ planet, onClick, recent, language, active = false, expandable = false, expanded = false, onToggle }) {
   const Art = planetArt[planet.id] || LoveCat
   const className = planet.id === 'work' ? 'pc-work' : 'pc-love'
   const isChinese = language === 'zh'
 
   return (
-    <button className={`planet-card drawer-planet-card ${className}`} type="button" onClick={onClick}>
+    <button className={`planet-card drawer-planet-card ${className} ${active ? 'active' : ''}`} type="button" onClick={onClick}>
       <div className="drawer-planet-main">
         <div className="pc-avatar"><Art /></div>
         <div className="drawer-planet-copy">
           <div className="drawer-planet-row">
             <div className="pc-name">{truncateTitle(getPlanetCardTitle(planet), 4)}</div>
-            <time className="pc-time">{localizeActivityTime(recent.time, isChinese)}</time>
+            {expandable ? (
+              <span
+                className={`pc-chevron ${expanded ? 'open' : ''}`}
+                role="button"
+                tabIndex={0}
+                aria-label={expanded ? (isChinese ? '收起' : 'Collapse') : (isChinese ? '展开' : 'Expand')}
+                onClick={(event) => { event.stopPropagation(); onToggle?.() }}
+              >
+                <svg viewBox="0 0 24 24"><path d="m9 6 6 6-6 6" /></svg>
+              </span>
+            ) : (
+              <time className="pc-time">{localizeActivityTime(recent.time, isChinese)}</time>
+            )}
           </div>
           <div className="pc-quote">{recent.rawText || recent.text}</div>
         </div>
@@ -1586,14 +1538,133 @@ function DrawerPlanetCard({ planet, onClick, recent, language }) {
   )
 }
 
-function SideDrawer({ open, mode, setMode, onClose, recentFor, planets, drawerWidth, onResizeStart, language }) {
+// `docked`: render the same drawer as a permanent left column (not a sliding
+// overlay) — always open, planets list, no scrim/close/resize. activePlanetId
+// highlights the current chat.
+// A conversation row (Bird DM or a persona DM) — same compact look as a planet
+// card. Click enters the chat directly, like the group chat.
+// WeChat-style group avatar: every member (up to 9) shown, shrunk and tiled
+// regularly. Columns by count (≤1→1, ≤4→2, else 3, max 3×3); partial last row
+// is centered, so there are no empty cells.
+function GroupAvatar({ members = [] }) {
+  const items = members.slice(0, 9)
+  if (!items.length) return null
+  const cols = items.length <= 1 ? 1 : items.length <= 4 ? 2 : 3
+  return (
+    <div className="group-avatar" style={{ '--cols': cols }}>
+      {items.map(member => (
+        <span key={member.id} className="group-avatar-cell" style={{ backgroundColor: member.color }}>
+          <PersonaAvatar persona={member} />
+        </span>
+      ))}
+    </div>
+  )
+}
+
+// A planet is a folder (directory) row — same row layout as Bird/conversations
+// (38px avatar, name), just with a chevron instead of a preview. Clicking the
+// whole row toggles its conversations open/closed.
+function DrawerPlanetFolder({ planet, language, expanded, onToggle, onRename }) {
+  const Art = planetArt[planet.id] || LoveCat
+  const isChinese = language === 'zh'
+  const name = getPlanetCardTitle(planet)
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(name)
+  const startEdit = (event) => { event.stopPropagation(); setDraft(name); setEditing(true) }
+  const commit = () => {
+    const value = draft.trim()
+    if (value && value !== name) onRename?.(planet, value)
+    setEditing(false)
+  }
+  return (
+    <div className="planet-card drawer-planet-card drawer-folder" role="button" tabIndex={0} onClick={() => { if (!editing) onToggle() }}>
+      <div className="drawer-planet-main">
+        <div className="pc-avatar"><Art /></div>
+        <div className="drawer-planet-copy">
+          <div className="drawer-planet-row">
+            {editing ? (
+              <input
+                className="pc-name-input"
+                value={draft}
+                autoFocus
+                onChange={(event) => setDraft(event.target.value)}
+                onClick={(event) => event.stopPropagation()}
+                onBlur={commit}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') { event.preventDefault(); commit() }
+                  if (event.key === 'Escape') { setDraft(name); setEditing(false) }
+                }}
+              />
+            ) : (
+              <div className="pc-name pc-folder-name">
+                <span className="pc-folder-name-text" onClick={startEdit} title={isChinese ? '点击改名' : 'Click to rename'}>{truncateTitle(name, 10)}</span>
+                <button type="button" className="pc-folder-edit" onClick={startEdit} aria-label={isChinese ? '改名' : 'Rename'}>
+                  <svg viewBox="0 0 24 24"><path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" /></svg>
+                </button>
+              </div>
+            )}
+            <span
+              className={`pc-chevron ${expanded ? 'open' : ''}`}
+              role="button"
+              aria-label={expanded ? (isChinese ? '收起' : 'Collapse') : (isChinese ? '展开' : 'Expand')}
+              onClick={(event) => { event.stopPropagation(); onToggle() }}
+            >
+              <svg viewBox="0 0 24 24"><path d="m9 6 6 6-6 6" /></svg>
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function DrawerConversationCard({ avatar, name, lastText, time, active, onClick, language, color, pinned = false, nested = false }) {
   const isChinese = language === 'zh'
   return (
+    <button className={`planet-card drawer-planet-card dm-card ${pinned ? 'pinned' : ''} ${nested ? 'nested' : ''} ${active ? 'active' : ''}`} type="button" onClick={onClick}>
+      <div className="drawer-planet-main">
+        <div className="pc-avatar dm-card-avatar" style={color ? { backgroundColor: color } : undefined}>{avatar}</div>
+        <div className="drawer-planet-copy">
+          <div className="drawer-planet-row">
+            <div className="pc-name">{truncateTitle(name, 8)}</div>
+            {time ? <time className="pc-time">{time}</time> : null}
+          </div>
+          <div className="pc-quote">{lastText || (isChinese ? '开始聊天' : 'Start chatting')}</div>
+        </div>
+      </div>
+    </button>
+  )
+}
+
+function SideDrawer({ open, mode, setMode, onClose, recentFor, planets, drawerWidth, onResizeStart, language, docked = false, activePlanetId = null, activeDmAgentId = null, dmConversations = [], personas = [], onCreatePlanet, onCreatePersona, onRenamePlanet }) {
+  const isChinese = language === 'zh'
+  const isOpen = docked || open
+  const effectiveMode = docked ? 'planets' : mode
+  const [createMenuOpen, setCreateMenuOpen] = useState(false)
+  const createMenuRef = useRef(null)
+  // Planets are expanded by default (empty = none collapsed); toggling adds/removes.
+  const [collapsedPlanets, setCollapsedPlanets] = useState(() => new Set())
+  const togglePlanet = (planetId) => setCollapsedPlanets(prev => {
+    const next = new Set(prev)
+    if (next.has(planetId)) next.delete(planetId)
+    else next.add(planetId)
+    return next
+  })
+  const fmtTime = (iso) => (iso ? localizeActivityTime(formatActivityTime(new Date(iso).getTime()), isChinese) : '')
+  useEffect(() => {
+    if (!createMenuOpen) return
+    const onDown = (event) => {
+      if (createMenuRef.current && !createMenuRef.current.contains(event.target)) setCreateMenuOpen(false)
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [createMenuOpen])
+  return (
     <>
-      {open && <button className="chirp-home-drawer-scrim" type="button" aria-label={isChinese ? '关闭菜单' : 'Close menu'} onClick={onClose} />}
-      <aside className={`chirp-home-drawer ${open ? 'open' : ''}`} style={{ '--drawer-width': `${drawerWidth}px` }}>
+      {!docked && open && <button className="chirp-home-drawer-scrim" type="button" aria-label={isChinese ? '关闭菜单' : 'Close menu'} onClick={onClose} />}
+      <aside className={`chirp-home-drawer ${isOpen ? 'open' : ''} ${docked ? 'docked' : ''}`} style={{ '--drawer-width': `${drawerWidth}px` }}>
         <div className="chirp-home-drawer-head">
-          {mode === 'planets' ? (
+          {effectiveMode === 'planets' ? (
             <strong>{isChinese ? '我的星球' : 'My Planet'}</strong>
           ) : (
             <button
@@ -1607,10 +1678,24 @@ function SideDrawer({ open, mode, setMode, onClose, recentFor, planets, drawerWi
               home
             </button>
           )}
-          <button type="button" aria-label={isChinese ? '关闭菜单' : 'Close menu'} onClick={onClose}>×</button>
+          <div className="chirp-create-menu-wrap" ref={createMenuRef}>
+            <button
+              className="chirp-create-btn"
+              type="button"
+              aria-label={isChinese ? '新建' : 'Create'}
+              onClick={() => setCreateMenuOpen(open => !open)}
+            >+</button>
+            {createMenuOpen && (
+              <div className="chirp-create-menu">
+                <button type="button" onClick={() => { setCreateMenuOpen(false); onClose?.(); onCreatePlanet?.() }}>{isChinese ? '创建我的星球' : 'create my planet'}</button>
+                <button type="button" onClick={() => { setCreateMenuOpen(false); onClose?.(); onCreatePersona?.() }}>{isChinese ? '创建分身' : 'create my persona'}</button>
+              </div>
+            )}
+          </div>
+          {!docked && <button type="button" aria-label={isChinese ? '关闭菜单' : 'Close menu'} onClick={onClose}>×</button>}
         </div>
 
-        {mode === 'menu' ? (
+        {effectiveMode === 'menu' ? (
           <div className="chirp-home-menu-list">
             <button
               type="button"
@@ -1643,38 +1728,89 @@ function SideDrawer({ open, mode, setMode, onClose, recentFor, planets, drawerWi
           </div>
         ) : (
           <div className="chirp-home-drawer-planets">
-            <button className="planet-card pc-create drawer-planet-card drawer-create-card" type="button" aria-label={isChinese ? '创建星球' : 'Create planet'}>
-              <span className="drawer-create-plus">+</span>
-              <span className="drawer-create-label">{isChinese ? '创建我的星球' : 'create my planet'}</span>
-            </button>
-            {planets.map(planet => (
-              <DrawerPlanetCard
-                key={planet.id}
-                planet={planet}
-                recent={recentFor(planet)}
-                language={language}
-                onClick={() => {
-                  onClose()
-                  navigateTo('chirp', 'planet', planet.id)
-                }}
-              />
-            ))}
+            <DrawerConversationCard
+              avatar={<HomeBird />}
+              name={isChinese ? '小鸟' : 'Bird'}
+              lastText={dmConversations.find(dm => dm.agentId === 'bird')?.lastText || ''}
+              time={fmtTime(dmConversations.find(dm => dm.agentId === 'bird')?.lastAt)}
+              pinned
+              active={activeDmAgentId === 'bird'}
+              language={language}
+              onClick={() => { onClose(); navigateTo('chirp', 'dm', 'bird') }}
+            />
+            {planets.map(planet => {
+              const planetPersonas = getPersonasForPlanet(planet)
+              const planetPersonaIds = new Set(planetPersonas.map(item => item.id))
+              const planetDms = dmConversations.filter(dm => planetPersonaIds.has(dm.agentId))
+              const expanded = !collapsedPlanets.has(planet.id)
+              const planetRecent = recentFor(planet)
+              return (
+                <Fragment key={planet.id}>
+                  <DrawerPlanetFolder
+                    planet={planet}
+                    language={language}
+                    expanded={expanded}
+                    onToggle={() => togglePlanet(planet.id)}
+                    onRename={onRenamePlanet}
+                  />
+                  {expanded && (
+                    <DrawerConversationCard
+                      nested
+                      avatar={<GroupAvatar members={[...planetPersonas, { id: 'user', color: '#F5C878', avatar: UserAvatar }]} />}
+                      name={getGroupName(planet)}
+                      lastText={planetRecent.rawText || planetRecent.text}
+                      time={localizeActivityTime(planetRecent.time, isChinese)}
+                      active={planet.id === activePlanetId}
+                      language={language}
+                      onClick={() => { onClose(); navigateTo('chirp', 'planet', planet.id) }}
+                    />
+                  )}
+                  {expanded && planetDms.map(dm => {
+                    const persona = personas.find(item => item.id === dm.agentId)
+                    return (
+                      <DrawerConversationCard
+                        key={dm.conversationId}
+                        nested
+                        avatar={persona ? <PersonaAvatar persona={persona} /> : null}
+                        name={persona?.name || dm.title || dm.agentId}
+                        lastText={dm.lastText}
+                        time={fmtTime(dm.lastAt)}
+                        color={persona?.color}
+                        active={activeDmAgentId === dm.agentId}
+                        language={language}
+                        onClick={() => { onClose(); navigateTo('chirp', 'persona-dm', dm.agentId) }}
+                      />
+                    )
+                  })}
+                </Fragment>
+              )
+            })}
+            {(() => {
+              const inPlanet = new Set(planets.flatMap(planet => getPersonasForPlanet(planet).map(item => item.id)))
+              return dmConversations.filter(dm => dm.agentId !== 'bird' && !inPlanet.has(dm.agentId)).map(dm => {
+                const persona = personas.find(item => item.id === dm.agentId)
+                return (
+                  <DrawerConversationCard
+                    key={dm.conversationId}
+                    avatar={persona ? <PersonaAvatar persona={persona} /> : null}
+                    name={persona?.name || dm.title || dm.agentId}
+                    lastText={dm.lastText}
+                    color={persona?.color}
+                    active={activeDmAgentId === dm.agentId}
+                    language={language}
+                    onClick={() => { onClose(); navigateTo('chirp', 'persona-dm', dm.agentId) }}
+                  />
+                )
+              })
+            })()}
           </div>
         )}
 
-        <div className="chirp-home-drawer-admin">
-          <span className="chirp-drawer-bird-avatar"><HomeBird /></span>
-          <strong>{isChinese ? '小鸟' : 'Bird'}</strong>
-          <button type="button">{isChinese ? '聊天' : 'Chat'}</button>
-        </div>
-        <button className="chirp-home-drawer-resize" type="button" aria-label={isChinese ? '调整侧栏宽度' : 'Resize sidebar'} onMouseDown={onResizeStart} />
+        {onResizeStart && <button className="chirp-home-drawer-resize" type="button" aria-label={isChinese ? '调整侧栏宽度' : 'Resize sidebar'} onMouseDown={onResizeStart} />}
       </aside>
     </>
   )
 }
 
 export default ChirpHomePage
-
-
-
 

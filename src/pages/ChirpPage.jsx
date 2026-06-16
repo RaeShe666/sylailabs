@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import {
   BIRD,
@@ -8,87 +8,185 @@ import {
   PersonaAvatar,
   UserAvatar,
   formatMessageTime,
+  formatChatSeparator,
   getPersonasForPlanet,
   getPlanetRecent,
   savePlanetMeta,
   writePlanetActivity
 } from './chirpShared'
-import { loadChirpMessages, loadCustomPersonas, loadPlanetMemberPersonas, saveChirpMessage, savePlanetMemberPersonas, updateChirpPlanet } from './chirpSupabase'
+import { ensureChirpConversations, loadChirpMessages, loadChirpMessagesByConversation, loadOlderChirpMessages, loadCustomPersonas, loadPlanetMemberPersonas, saveChirpMessage, savePlanetMemberPersonas, updateChirpConversationTitle, updateChirpPlanet } from './chirpSupabase'
+import { getCachedMessages, setCachedMessages } from './chirpHistoryCache'
 import './ChirpPage.css'
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 const MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+// Reply timing (persona-v2 §5.3): people split one thought across several quick
+// messages, so we don't reply on send — we reply once the user goes quiet.
+// A reply fires only when, for IDLE_MS, there has been no input activity
+// (typing / emoji / IME composition) AND the input box is empty AND no reply
+// is already streaming. Messages sent meanwhile just accumulate into the batch;
+// sending during a streaming reply queues rather than errors.
+const IDLE_MS = 4000          // input-silence window before replying
+const IDLE_POLL_MS = 400      // re-check cadence while waiting
+const IDLE_DEBUG = false      // show on-screen batching/idle timing panel (set false to hide)
+const getApiBase = () => {
+  const isDevFrontend = ['5173', '3000'].includes(window.location.port)
+  if (isDevFrontend) return `${window.location.protocol}//${window.location.hostname}:8080`
+  return import.meta.env.VITE_API_URL || ''
+}
 
 const createInitialMessages = (planet) => {
-  if (planet?.id === 'work') {
-    return [
-      { id: 'm1', type: 'memo', text: '明天要讲那个方案，我不想显得太用力，但又怕被忽略。', createdAt: Date.now() - 1000 * 60 * 5 },
-      { id: 'm2', type: 'user', text: '@军师 这个会我应该怎么开头？', read: true, createdAt: Date.now() - 1000 * 60 * 4 },
-      { id: 'm3', type: 'agent', agentId: 'strategist', text: '先别证明你很努力，先定义这场会要拿到什么结果。开头用一句话框住问题，再给两个选择，让他们进你的结构里。', createdAt: Date.now() - 1000 * 60 * 3 }
-    ]
-  }
-
   return [
-    { id: 'm1', type: 'memo', text: '他今天只回了一个“嗯嗯”，我有点想装作没事，但其实一直在想。', createdAt: Date.now() - 1000 * 60 * 4 },
-    { id: 'm2', type: 'user', text: '@恋爱脑 这是不是有点冷了？', read: true, tapbacks: ['🙃'], createdAt: Date.now() - 1000 * 60 * 3 },
-    { id: 'm3', type: 'agent', agentId: 'lovebrain', text: '先别急。我知道你现在脑子已经开始跑八百集了，但一个“嗯嗯”不能直接判案，你要看他接下来有没有补动作。', createdAt: Date.now() - 1000 * 60 * 2 }
+    { id: 'm1', type: 'user', isPersonalRecord: true, text: '他今天只回了一个“嗯嗯”，我有点想装作没事，但其实一直在想。', createdAt: Date.now() - 1000 * 60 * 4 },
+    { id: 'm2', type: 'user', text: '@诞总 这是不是有点冷了？', read: true, createdAt: Date.now() - 1000 * 60 * 3 },
+    { id: 'm3', type: 'agent', agentId: 'danzong', text: '一个“嗯嗯”还不能判死刑，最多算关系天气预报里飘过一朵云。你先别替他把整部剧写完，看他后面有没有补动作。', createdAt: Date.now() - 1000 * 60 * 2 }
   ]
 }
 
-function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en' }) {
+function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', onOpenPersona = null, dmAgent = null, dmConversationId: dmConversationIdProp = null, onDmStarted = null }) {
   const { user, getAccessToken } = useAuth()
   const isChinese = language === 'zh'
-  const initialAgents = useMemo(() => getPersonasForPlanet(planetConfig), [planetConfig])
+  // DM mode: a 1:1 conversation with one persona (persona_dm). The backend keeps
+  // it planet-independent for now; only that persona is in the room.
+  const isDM = !!dmAgent
+  const isBirdDM = dmAgent?.id === 'bird'
+  const initialAgents = useMemo(
+    () => (dmAgent ? (isBirdDM ? [] : [dmAgent]) : getPersonasForPlanet(planetConfig)),
+    [planetConfig, dmAgent, isBirdDM]
+  )
   const [planet, setPlanet] = useState({
     id: planetConfig.id,
-    name: planetConfig.roomName,
+    name: planetConfig.roomName,                                   // planet (folder) name
+    groupName: planetConfig.groupName || planetConfig.roomName,    // group chat name (separate)
     type: planetConfig.type,
     tone: planetConfig.tone,
     background: planetConfig.background
   })
-  const [userProfile] = useState({ nickname: '鹿', avatar: 'S' })
+  // Nickname is not collected during onboarding yet; leave it empty so the
+  // runtime tells the model not to invent or use a name.
+  const [userProfile] = useState({ nickname: '', avatar: 'S' })
   const [agents, setAgents] = useState(initialAgents)
-  const [messages, setMessages] = useState(() => createInitialMessages(planetConfig))
+  const [messages, setMessages] = useState(() => (dmAgent ? [] : createInitialMessages(planetConfig)))
+  const [dmConversationId, setDmConversationId] = useState(null)
   const [input, setInput] = useState('')
+  const [quoting, setQuoting] = useState(null)   // the bubble being quoted (right-click), or null
   const [activeAgentId, setActiveAgentId] = useState(initialAgents[0]?.id || null)
   const [mentionOpen, setMentionOpen] = useState(false)
   const [mentionQuery, setMentionQuery] = useState('')
   const [mentionIndex, setMentionIndex] = useState(0)
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const [settingsDraft, setSettingsDraft] = useState({ name: planetConfig.roomName })
+  const [settingsDraft, setSettingsDraft] = useState({ name: planetConfig.groupName || planetConfig.roomName })
+  const [nameEditing, setNameEditing] = useState(false)
   const [typingAgentId, setTypingAgentId] = useState(null)
+  const [typingAgentIds, setTypingAgentIds] = useState([])
+  const [streamingReplies, setStreamingReplies] = useState({})
+  const [turnInFlight, setTurnInFlight] = useState(false)
   const [toast, setToast] = useState('')
   const timelineRef = useRef(null)
   const fileInputRef = useRef(null)
+  const textareaRef = useRef(null)
   const previousPlanetIdRef = useRef(planetConfig.id)
+  const collectRef = useRef(null)
+  const collectTimerRef = useRef(null)
+  const inputDraftRef = useRef('')
+  const lastActivityRef = useRef(0)   // last input activity (typing/emoji/IME) or send
+  const isComposingRef = useRef(false)   // IME composition in progress (preedit not yet committed)
+  const [idleEvents, setIdleEvents] = useState([])
+  const idleLog = (msg) => {
+    if (!IDLE_DEBUG) return
+    console.log('[chirp-idle]', msg)
+    const stamp = new Date().toISOString().slice(11, 23)
+    setIdleEvents(prev => [...prev.slice(-150), `${stamp}  ${msg}`])
+  }
+  const turnInFlightRef = useRef(false)
+  // History paging + scroll anchoring (see chirp-history-loading-cache).
+  const [hasMoreHistory, setHasMoreHistory] = useState(false)
+  const [loadingOlder, setLoadingOlder] = useState(false)
+  const atBottomRef = useRef(true)          // is the view pinned to the latest message?
+  const skipAutoScrollRef = useRef(false)   // set during an older-page prepend (preserve position)
+  const loadingOlderRef = useRef(false)     // guard against overlapping older-page fetches
+  const historyKeyRef = useRef(null)        // current conversation cache key, for writes from pushMessage
+
+  // The cache/paging key: DM = its conversation id; group = its conversation id
+  // (or the planet id before that resolves — group messages carry planet_id too).
+  // Cache/paging key. Group: the planet db id (stable, one group per planet, and
+  // group messages carry planet_id). DM: its conversation id.
+  const conversationKey = isDM
+    ? (dmConversationId || dmConversationIdProp || null)
+    : (planetConfig.dbId || null)
+  useEffect(() => { historyKeyRef.current = conversationKey }, [conversationKey])
 
   useEffect(() => {
     setPlanet(prev => ({
       ...prev,
       id: planetConfig.id,
       name: planetConfig.roomName,
+      groupName: planetConfig.groupName || planetConfig.roomName,
       type: planetConfig.type,
       tone: planetConfig.tone,
       background: planetConfig.background,
       dbId: planetConfig.dbId
     }))
-    setSettingsDraft({ name: planetConfig.roomName })
-  }, [planetConfig.id, planetConfig.roomName, planetConfig.type, planetConfig.tone, planetConfig.background, planetConfig.dbId])
+    setSettingsDraft({ name: planetConfig.groupName || planetConfig.roomName })
+    setNameEditing(false)
+  }, [planetConfig.id, planetConfig.roomName, planetConfig.groupName, planetConfig.type, planetConfig.tone, planetConfig.background, planetConfig.dbId])
 
   useEffect(() => {
+    if (isDM || !user || !planetConfig?.dbId) return
+    let cancelled = false
+    // Just resolve/sync the conversation id; message loading is handled by the
+    // dbId loader below (group messages carry planet_id, so they load fine
+    // before the conversation id resolves).
+    ensureChirpConversations(user, planetConfig, agents)
+      .then(nextPlanet => {
+        if (!cancelled && nextPlanet?.conversationId) {
+          setPlanet(prev => ({ ...prev, conversationId: nextPlanet.conversationId }))
+        }
+      })
+      .catch(error => {
+        console.warn('Failed to ensure Chirp conversations:', error)
+      })
+    return () => { cancelled = true }
+  }, [user, planetConfig, agents])
+
+  useEffect(() => {
+    if (isDM) return
     if (previousPlanetIdRef.current === planetConfig.id) return
     previousPlanetIdRef.current = planetConfig.id
+    if (collectTimerRef.current) window.clearTimeout(collectTimerRef.current)
+    collectRef.current = null
     setAgents(initialAgents)
     setActiveAgentId(initialAgents[0]?.id || null)
-    setMessages(createInitialMessages(planetConfig))
+    // Seed from this conversation's cache (instant, never another conversation's
+    // content) instead of flashing the intro placeholder; the network refresh
+    // below overwrites it. Arm a scroll-to-bottom for this entry.
+    const cacheKey = planetConfig.dbId || null
+    const cached = cacheKey ? getCachedMessages(cacheKey) : null
+    setMessages(cached || createInitialMessages(planetConfig))
+    setHasMoreHistory(false)
+    atBottomRef.current = true
   }, [planetConfig.id, initialAgents, planetConfig])
 
+  useEffect(() => () => {
+    if (collectTimerRef.current) window.clearTimeout(collectTimerRef.current)
+  }, [])
+
   useEffect(() => {
+    if (isDM) return
     let cancelled = false
     const loadRemoteMessages = async () => {
       try {
-        const remoteMessages = await loadChirpMessages(planetConfig)
-        if (!cancelled && remoteMessages?.length) setMessages(remoteMessages)
+        // Group history pages by planet_id (group messages always carry it, and
+        // older rows may predate the conversation_id column) — keep this column
+        // identical to the older-page fetch so scroll-up loads everything.
+        const { messages: remoteMessages, hasMore } = await loadChirpMessages({ dbId: planetConfig.dbId })
+        if (cancelled) return
+        if (remoteMessages?.length) {
+          const cacheKey = planetConfig.dbId || null
+          if (cacheKey) setCachedMessages(cacheKey, remoteMessages)
+          setMessages(remoteMessages)
+        }
+        setHasMoreHistory(hasMore)
       } catch (error) {
         console.warn('Failed to load Chirp messages:', error)
       }
@@ -103,7 +201,14 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en' })
       try {
         const customPersonas = user ? await loadCustomPersonas(user) : []
         const remoteAgents = await loadPlanetMemberPersonas(planetConfig, getPersonasForPlanet(planetConfig), customPersonas)
-        if (!cancelled) setAgents(remoteAgents)
+        if (!cancelled) {
+          setAgents(remoteAgents)
+          if (user) {
+            ensureChirpConversations(user, planetConfig, remoteAgents).catch(error => {
+              console.warn('Failed to sync conversation members:', error)
+            })
+          }
+        }
       } catch (error) {
         console.warn('Failed to load Planet members:', error)
       }
@@ -129,8 +234,69 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en' })
     }
   }, [planetConfig, user])
 
+  // Opening a DM ensures its own conversation up front (so it lists immediately
+  // and never borrows a planet's id), then loads ONLY that conversation's
+  // history — never planet messages.
+  useEffect(() => {
+    if (!isDM || !dmAgent?.id) return
+    let alive = true
+    atBottomRef.current = true
+    setHasMoreHistory(false)
+
+    // Fast path: the sidebar usually already knows this DM's conversation id, so
+    // seed instantly from cache (no blank flash) and load its history right away
+    // — the `ensure` round trip then runs in the background only to sync.
+    const knownId = dmConversationIdProp || null
+    setDmConversationId(knownId)
+    setMessages((knownId && getCachedMessages(knownId)) || [])
+
+    const loadWindow = async (conversationId) => {
+      const { messages: history, hasMore } = await loadChirpMessagesByConversation(conversationId)
+      if (!alive) return
+      if (history.length) {
+        setCachedMessages(conversationId, history)
+        setMessages(history)
+      }
+      setHasMoreHistory(hasMore)
+    }
+
+    ;(async () => {
+      try {
+        if (knownId) {
+          loadWindow(knownId).catch(error => console.warn('Failed to load DM messages:', error))
+        }
+        const token = await getAccessToken()
+        if (!token) return
+        const body = isBirdDM
+          ? { conversation: { type: 'bird_dm', title: dmAgent.name }, agents: [] }
+          : { conversation: { type: 'persona_dm', agentId: dmAgent.id, personaId: dmAgent.id, title: dmAgent.name }, agents: [{ id: dmAgent.id, name: dmAgent.name, role: dmAgent.role }] }
+        const res = await fetch(`${getApiBase()}/api/chirp/conversations/ensure`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify(body)
+        })
+        const json = await res.json().catch(() => null)
+        const conversationId = json?.conversationId || null
+        if (!alive) return
+        if (conversationId) {
+          setDmConversationId(conversationId)
+          if (conversationId !== knownId) await loadWindow(conversationId)
+        }
+        onDmStarted?.()
+      } catch (error) {
+        console.warn('Ensure DM conversation failed:', error)
+      }
+    })()
+    return () => { alive = false }
+  }, [isDM, isBirdDM, dmAgent, dmConversationIdProp])
+
   const bird = BIRD
-  const visibleMembers = [{ id: 'user', name: userProfile.nickname, color: '#F5C878', avatar: UserAvatar }, bird, ...agents]
+  // Bird is DM-only now — it is never a member of a group. In a bird DM the
+  // single member is bird; in a group / persona DM it's the user + the agents.
+  const visibleMembers = [
+    { id: 'user', name: userProfile.nickname || 'S', color: '#F5C878', avatar: UserAvatar },
+    ...(isBirdDM ? [bird] : agents)
+  ]
   const memberCount = visibleMembers.length
   const RoomAvatar = planetConfig.avatar || DeerAvatar
 
@@ -158,36 +324,85 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en' })
 
   const pushMessage = (message) => {
     const nextMessage = { id: `${Date.now()}-${Math.random()}`, createdAt: Date.now(), ...message }
-    setMessages(prev => [...prev, nextMessage])
-    requestAnimationFrame(() => {
-      if (timelineRef.current) timelineRef.current.scrollTop = timelineRef.current.scrollHeight
+    atBottomRef.current = true   // sending/receiving pins the view to the latest
+    setMessages(prev => {
+      const next = [...prev, nextMessage]
+      if (historyKeyRef.current) setCachedMessages(historyKeyRef.current, next)
+      return next
     })
     return nextMessage
   }
 
+  useEffect(() => {
+    if (!Object.keys(streamingReplies).length) return
+    requestAnimationFrame(() => {
+      if (timelineRef.current) timelineRef.current.scrollTop = timelineRef.current.scrollHeight
+    })
+  }, [streamingReplies])
+
+  // Keep the view pinned to the latest message: on entry (atBottomRef armed) and
+  // whenever messages change while already at the bottom. An older-page prepend
+  // sets skipAutoScrollRef so we preserve the reading position instead.
+  useLayoutEffect(() => {
+    const el = timelineRef.current
+    if (!el) return
+    if (skipAutoScrollRef.current) { skipAutoScrollRef.current = false; return }
+    if (atBottomRef.current) el.scrollTop = el.scrollHeight
+  }, [messages])
+
+  // Scroll up near the top → load the previous page of older messages, keeping
+  // the current reading position steady (no jump).
+  const loadOlderHistory = async () => {
+    if (loadingOlderRef.current || !hasMoreHistory) return
+    const oldest = messages.find(item => item.createdAt)
+    if (!oldest) return
+    loadingOlderRef.current = true
+    setLoadingOlder(true)
+    const el = timelineRef.current
+    const prevHeight = el ? el.scrollHeight : 0
+    const key = historyKeyRef.current
+    try {
+      const { messages: older, hasMore } = await loadOlderChirpMessages({
+        conversationId: isDM ? dmConversationId : null,   // group → planet_id, DM → conversation_id
+        planetId: isDM ? null : planetConfig.dbId,
+        beforeCreatedAt: new Date(oldest.createdAt).toISOString()
+      })
+      if (older.length) {
+        skipAutoScrollRef.current = true
+        setMessages(prev => {
+          const merged = [...older, ...prev]
+          if (key) setCachedMessages(key, merged)
+          return merged
+        })
+        requestAnimationFrame(() => {
+          if (el) el.scrollTop = el.scrollHeight - prevHeight   // preserve position
+        })
+      }
+      setHasMoreHistory(hasMore)
+    } catch (error) {
+      console.warn('Failed to load older messages:', error)
+    } finally {
+      loadingOlderRef.current = false
+      setLoadingOlder(false)
+    }
+  }
+
+  const handleTimelineScroll = () => {
+    const el = timelineRef.current
+    if (!el) return
+    atBottomRef.current = (el.scrollHeight - el.scrollTop - el.clientHeight) < 80
+    if (el.scrollTop < 60) loadOlderHistory()
+  }
+
   const persistMessage = (message) => {
-    saveChirpMessage(planetConfig, message).catch(error => {
+    saveChirpMessage({ ...planetConfig, conversationId: planet.conversationId || planetConfig.conversationId }, message).catch(error => {
       console.warn('Failed to save Chirp message:', error)
     })
   }
 
   const rememberUserMessage = (text, timestamp = Date.now()) => {
+    if (isDM) return   // a DM must not write into a planet's recent-activity cache
     writePlanetActivity(planet.id, text, timestamp)
-  }
-
-  const addTapbackToLastUserMessage = (emoji) => {
-    if (!emoji) return
-    setMessages(prev => {
-      const next = [...prev]
-      for (let index = next.length - 1; index >= 0; index -= 1) {
-        if (next[index].type === 'user') {
-          const tapbacks = next[index].tapbacks || []
-          next[index] = { ...next[index], tapbacks: [...tapbacks, emoji] }
-          break
-        }
-      }
-      return next
-    })
   }
 
   const showToast = (text) => {
@@ -195,21 +410,51 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en' })
     window.setTimeout(() => setToast(''), 2200)
   }
 
+  // Mentions count anywhere in the message (mirrors backend parseMention).
   const resolveMention = (text) => {
-    if (/^@all\b/i.test(text)) return 'all'
-    if (/^@bird\b/i.test(text) || /^@小鸟\b/.test(text)) return 'bird'
-    const mentionedAgent = agents.find(agent => text.startsWith(`@${agent.name}`))
-    return mentionedAgent?.id || null
+    if (/@all\b/i.test(text)) return 'all'
+    if (/@(bird\b|小鸟)/i.test(text)) return 'bird'
+    const lower = text.toLowerCase()
+    const hits = agents
+      .map(agent => {
+        const aliases = [agent.name, agent.id].filter(Boolean).map(alias => String(alias).toLowerCase())
+        const positions = aliases.map(alias => lower.indexOf(`@${alias}`)).filter(index => index >= 0)
+        return positions.length ? { id: agent.id, index: Math.min(...positions) } : null
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.index - b.index)
+    return hits.length ? hits[0].id : null
   }
 
   const findMentionToken = (value) => {
-    const match = value.match(/(^|\s)@([^\s@]*)$/)
+    const match = value.match(/@([^\s@]*)$/)
     if (!match) return null
-    return { start: match.index + match[1].length, query: match[2] || '' }
+    return { start: match.index, query: match[1] || '' }
+  }
+
+  // Any input activity (typing, emoji insert) pushes back the idle window so a
+  // pending batch waits for the user to actually stop.
+  const markInputActivity = () => {
+    const now = Date.now()
+    const prev = lastActivityRef.current
+    if (prev && now - prev > 1500) idleLog(`⌨️ input resumed after ${now - prev}ms quiet`)
+    lastActivityRef.current = now
+  }
+
+  // IME (e.g. Chinese pinyin): while composing, the preedit string shows in the
+  // box but isn't committed to `value`, so the draft reads empty. Track an
+  // explicit "composing" flag so a pause on the candidate list never counts as
+  // an empty, quiet box and fires a reply mid-word.
+  const handleCompositionStart = () => { isComposingRef.current = true; markInputActivity() }
+  const handleCompositionEnd = (event) => {
+    isComposingRef.current = false
+    updateInput(event.target.value)   // commit the composed text + refresh activity
   }
 
   const updateInput = (value) => {
     setInput(value)
+    inputDraftRef.current = value
+    markInputActivity()
     const mentionToken = findMentionToken(value)
     if (!mentionToken) {
       setMentionOpen(false)
@@ -225,10 +470,27 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en' })
   const insertMention = (item) => {
     const mentionToken = findMentionToken(input)
     if (!mentionToken) return
-    setInput(`${input.slice(0, mentionToken.start)}${item.insertText}`)
+    const nextValue = `${input.slice(0, mentionToken.start)}${item.insertText}`
+    setInput(nextValue)
+    inputDraftRef.current = nextValue
     setMentionOpen(false)
     setMentionQuery('')
     setMentionIndex(0)
+  }
+
+  // Quoting a bubble shows it as a chip in the composer and, when it's an agent's
+  // line, auto-prepends an @mention of that agent (the user can delete it). DMs
+  // have a single counterpart, so the mention is pointless there.
+  const startQuote = (message) => {
+    setQuoting(message)
+    if (isDM || message.type !== 'agent') return
+    const agent = agents.find(item => item.id === message.agentId)
+    if (!agent) return
+    if (input.includes(`@${agent.name}`)) return
+    const next = `@${agent.name} ${input}`
+    setInput(next)
+    inputDraftRef.current = next
+    requestAnimationFrame(() => textareaRef.current?.focus())
   }
 
   const handleUploadFile = (event) => {
@@ -242,65 +504,140 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en' })
     showToast(isChinese ? '暂不支持图片上传。' : 'Image upload is not available yet.')
   }
 
-  const requestAgentReply = async (agent, currentMessages) => {
+  const requestChirpTurn = async (texts, currentMessages, replyTo = null) => {
     try {
-      const isLocalHost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-      const apiBase = import.meta.env.VITE_API_URL || (isLocalHost ? 'http://localhost:8080' : '')
-      const recent = getPlanetRecent(planet)
+      const apiBase = getApiBase()
       const token = await getAccessToken()
+      if (!token) {
+        return { success: false, error: 'auth_required' }
+      }
       const headers = { 'Content-Type': 'application/json' }
-      if (token) headers.Authorization = `Bearer ${token}`
-      const response = await fetch(`${apiBase}/api/chirp/reply`, {
+      headers.Authorization = `Bearer ${token}`
+
+      const response = await fetch(`${apiBase}/api/chirp/turn`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({
-          planet: { ...planet, recentUserMessage: recent.rawText || recent.text, recentUserMessageAt: recent.timestamp },
-          user: userProfile,
-          agent: {
-            id: agent.id,
-            name: agent.name,
-            role: agent.role,
-            systemPrompt: agent.systemPrompt,
-            skills: agent.skills
-          },
-          members: agents.map(({ id, name, role }) => ({ id, name, role })),
-          messages: currentMessages.slice(-12).map(message => ({
-            type: message.type,
-            text: message.text,
-            agentId: message.agentId
-          }))
-        })
+        body: JSON.stringify(buildTurnPayload(texts, currentMessages, replyTo))
       })
 
-      if (!response.ok) return null
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => '')
+        return { success: false, error: `HTTP ${response.status}: ${errorText}` }
+      }
       const result = await response.json()
-      if (!result?.success) return null
-      return result.reply
+      return result?.success ? result : { success: false, error: result?.error || 'unknown_error' }
     } catch (error) {
-      console.warn('Chirp reply failed:', error)
-      return null
+      console.warn('Chirp turn failed:', error)
+      return { success: false, error: error.message }
     }
   }
 
-  const replyAsAgent = async (agent, overrideText, conversationOverride = null) => {
+  const buildTurnPayload = (texts, currentMessages, replyTo = null) => {
+    const recent = getPlanetRecent(planet)
+    return {
+      planet: {
+        ...planet,
+        recentUserMessage: recent.rawText || recent.text,
+        recentUserMessageAt: recent.timestamp
+      },
+      conversation: isDM
+        ? (isBirdDM
+            ? { id: dmConversationId || null, type: 'bird_dm', title: dmAgent.name }
+            : { id: dmConversationId || null, type: 'persona_dm', agentId: dmAgent.id, personaId: dmAgent.id, title: dmAgent.name })
+        : { id: planet.conversationId || planetConfig.conversationId, type: 'group' },
+      user: userProfile,
+      texts,
+      ...(replyTo ? { replyTo } : {}),
+      agents: agents.map(agent => ({
+        id: agent.id,
+        name: agent.name,
+        role: agent.role,
+        systemPrompt: agent.systemPrompt,
+        skills: agent.skills,
+        identity: agent.identity,
+        relationship: agent.relationship,
+        voice_style: agent.voice_style,
+        boundaries: agent.boundaries,
+        reply_policy: agent.reply_policy,
+        memory_policy: agent.memory_policy,
+        examples: agent.examples,
+        lane_contract: agent.lane_contract
+      })),
+      members: visibleMembers.map(member => ({ id: member.id, name: member.name, role: member.role })),
+      messages: currentMessages.slice(-12).map(message => ({
+        type: message.type,
+        text: message.text,
+        agentId: message.agentId
+      }))
+    }
+  }
+
+  const requestChirpTurnStream = async (texts, currentMessages, onEvent, replyTo = null) => {
+    try {
+      const apiBase = getApiBase()
+      const token = await getAccessToken()
+      if (!token) return { success: false, error: 'auth_required' }
+
+      const response = await fetch(`${apiBase}/api/chirp/turn/stream`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(buildTurnPayload(texts, currentMessages, replyTo))
+      })
+
+      if (!response.ok || !response.body) {
+        return { ...(await requestChirpTurn(texts, currentMessages, replyTo)), fallback: true }
+      }
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let streamError = null
+
+      const emitBlock = (block) => {
+        const eventLine = block.split('\n').find(line => line.startsWith('event:'))
+        const dataLines = block.split('\n').filter(line => line.startsWith('data:'))
+        if (!eventLine || !dataLines.length) return
+        const event = eventLine.slice(6).trim()
+        const dataText = dataLines.map(line => line.slice(5).trimStart()).join('\n')
+        const data = dataText ? JSON.parse(dataText) : null
+        if (event === 'error') streamError = data?.error || 'stream_error'
+        onEvent?.(event, data)
+      }
+
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const blocks = buffer.split('\n\n')
+        buffer = blocks.pop() || ''
+        blocks.filter(Boolean).forEach(emitBlock)
+      }
+      buffer += decoder.decode()
+      if (buffer.trim()) emitBlock(buffer)
+
+      return streamError ? { success: false, error: streamError } : { success: true }
+    } catch (error) {
+      console.warn('Chirp turn stream failed:', error)
+      return { ...(await requestChirpTurn(texts, currentMessages, replyTo)), fallback: true }
+    }
+  }
+
+  // All callers pass canned text (bird admin replies); model replies go
+  // through /chirp/turn now.
+  const replyAsAgent = async (agent, overrideText) => {
     let typingVisible = false
     const typingTimer = overrideText ? null : window.setTimeout(() => {
       typingVisible = true
       setTypingAgentId(agent.id)
     }, 2000)
 
-    const modelReply = overrideText ? null : await requestAgentReply(agent, conversationOverride || messages)
     if (typingTimer) window.clearTimeout(typingTimer)
 
-    const replyText = overrideText || modelReply?.text
-    const tapback = modelReply?.emoji || null
-
-    if (!replyText && tapback) {
-      setTypingAgentId(null)
-      addTapbackToLastUserMessage(tapback)
-      return
-    }
-
+    const replyText = overrideText
     if (!replyText) {
       setTypingAgentId(null)
       showToast(isChinese ? 'AI 连接失败，请重试。' : 'AI connection failed. Please try again.')
@@ -309,7 +646,6 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en' })
 
     if (typingVisible) await sleep(380)
     setTypingAgentId(null)
-    addTapbackToLastUserMessage(tapback)
     const savedAgentMessage = pushMessage({ type: 'agent', agentId: agent.id, text: replyText })
     persistMessage(savedAgentMessage)
   }
@@ -317,7 +653,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en' })
   const addPersonaFromCommunity = () => {
     const candidate = PERSONA_POOL.find(persona => !agents.some(agent => agent.id === persona.id))
     if (!candidate) {
-      showToast(isChinese ? '没有更多可添加的模拟分身。' : 'No more mock personas available.')
+      showToast(isChinese ? '没有更多可添加的 persona。' : 'No more personas available.')
       return null
     }
     const nextAgents = [...agents, candidate]
@@ -328,19 +664,19 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en' })
   }
 
   const handleBirdAdmin = async (text) => {
-    const adminIntent = /(推荐|找.*persona|人格|拉|加入|踢|删除|移除|改名|名称|背景|昵称|头像|member|add|remove|rename)/i.test(text)
+    const adminIntent = /(推荐|找.*persona|人格|拉|加入|添加|踢|删除|移除|改名|名称|背景|昵称|头像|member|add|remove|rename)/i.test(text)
     if (!adminIntent) {
-      await replyAsAgent(bird, isChinese ? '我只处理这里的管理任务。你可以让我查找、添加、移除分身，或修改房间设置。' : 'I only handle admin tasks here. Ask me to find, add, remove, rename, or adjust the room.')
+      await replyAsAgent(bird, isChinese ? '我只处理这里的管理任务。你可以让我查找、添加、移除 persona，或修改房间设置。' : 'I only handle admin tasks here. Ask me to find, add, remove, rename, or adjust the room.')
       return
     }
     if (/(推荐|找.*persona|人格)/i.test(text)) {
       const candidate = PERSONA_POOL.find(persona => !agents.some(agent => agent.id === persona.id))
-      await replyAsAgent(bird, candidate ? (isChinese ? `这个房间已有核心声音，也可以加入 ${candidate.name}：${candidate.role}。` : `This room has its core voices, but it could use ${candidate.name}: ${candidate.role}.`) : (isChinese ? '所有模拟分身都已在这个房间中。' : 'All mock personas are already in this room.'))
+      await replyAsAgent(bird, candidate ? (isChinese ? `这个房间已有核心声音，也可以加入 ${candidate.name}：${candidate.role}。` : `This room has its core voices, but it could use ${candidate.name}: ${candidate.role}.`) : (isChinese ? '所有 persona 都已在这个房间中。' : 'All personas are already in this room.'))
       return
     }
-    if (/(拉|加入|add)/i.test(text)) {
+    if (/(加入|添加|add)/i.test(text)) {
       const added = addPersonaFromCommunity()
-      await replyAsAgent(bird, added ? (isChinese ? `好了，我加入了 ${added.name}。` : `Done. I added ${added.name}.`) : (isChinese ? '目前没有可添加的模拟分身。' : 'No mock persona is available right now.'))
+      await replyAsAgent(bird, added ? (isChinese ? `好了，我加入了 ${added.name}。` : `Done. I added ${added.name}.`) : (isChinese ? '目前没有可添加的 persona。' : 'No persona is available right now.'))
       return
     }
     if (/(踢|删除|移除|remove)/i.test(text)) {
@@ -361,59 +697,240 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en' })
       await replyAsAgent(bird, isChinese ? '好了，我把背景调得更温暖了一些。' : 'Done. I warmed up the background.')
     }
   }
+  const runCollectedTurn = async (collected) => {
+    const mention = collected.mention
+    const localMessages = collected.localMessages
 
-  const handleSend = async () => {
-    const text = input.trim()
-    if (!text) return
+    if (mention === 'all' || mention === 'bird') {
+      setActiveAgentId(null)
+    } else if (mention) {
+      setActiveAgentId(mention)
+    }
 
+    setTurnInFlight(true)
+    turnInFlightRef.current = true
+    setTypingAgentIds([])
+    const turn = await requestChirpTurnStream(collected.texts, collected.baseMessages, (event, data) => {
+      if (event === 'user_messages' && Array.isArray(data)) {
+        // Reconcile each local bubble with its persisted row, in order.
+        setMessages(prev => {
+          const next = [...prev]
+          data.forEach((saved, index) => {
+            const local = localMessages[index]
+            if (!local) return
+            const at = next.findIndex(message => message.id === local.id)
+            if (at >= 0) next[at] = { ...next[at], id: saved.id, text: saved.text || next[at].text, isPersonalRecord: saved.isPersonalRecord }
+          })
+          return next
+        })
+        return
+      }
+
+      if (event === 'agent_started' && data?.target?.agentId) {
+        setTypingAgentIds(prev => Array.from(new Set([...prev, data.target.agentId])))
+        return
+      }
+
+      if (event === 'agent_delta' && data?.target?.agentId && data.delta) {
+        // First token arrived: swap typing bubble for the live streaming bubble.
+        setTypingAgentIds(prev => prev.filter(id => id !== data.target.agentId))
+        setStreamingReplies(prev => ({
+          ...prev,
+          [data.index]: {
+            agentId: data.target.agentId,
+            text: (prev[data.index]?.text || '') + data.delta
+          }
+        }))
+        return
+      }
+
+      if (event === 'agent_reset' && data?.target?.agentId) {
+        // The pass turned out to be an internal tool call; discard partial text.
+        setStreamingReplies(prev => {
+          const next = { ...prev }
+          delete next[data.index]
+          return next
+        })
+        setTypingAgentIds(prev => Array.from(new Set([...prev, data.target.agentId])))
+        return
+      }
+
+      if (event === 'agent_finished' && data?.target?.agentId) {
+        setTypingAgentIds(prev => prev.filter(id => id !== data.target.agentId))
+        return
+      }
+
+      if (event === 'agent_error' && data?.target) {
+        setStreamingReplies(prev => {
+          const next = { ...prev }
+          delete next[data.index]
+          return next
+        })
+        return
+      }
+
+      if (event === 'agent_message' && data?.message) {
+        const message = data.message
+        setStreamingReplies(prev => {
+          const next = { ...prev }
+          delete next[data.index]
+          return next
+        })
+        if (message.text) pushMessage(message)
+      }
+    }, collected.replyTo)
+
+    setTurnInFlight(false)
+    turnInFlightRef.current = false
+    setTypingAgentId(null)
+    setTypingAgentIds([])
+    setStreamingReplies({})
+
+    if (!turn?.success) {
+      const authError = turn?.error === 'auth_required' || String(turn?.error || '').includes('401')
+      showToast(authError
+        ? (isChinese ? '请先登录后再聊天。' : 'Please sign in before chatting.')
+        : (isChinese ? `AI 连接失败：${turn?.error || 'unknown'}` : `AI connection failed: ${turn?.error || 'unknown'}`))
+    } else if (turn.messages?.length) {
+      // Non-stream fallback: reconcile local bubbles with persisted rows in order.
+      const returnedUserMessages = turn.messages.filter(message => message.type === 'user' || message.type === 'memo')
+      if (returnedUserMessages.length) {
+        setMessages(prev => {
+          const next = [...prev]
+          returnedUserMessages.forEach((saved, index) => {
+            const local = localMessages[index]
+            if (!local) return
+            const at = next.findIndex(message => message.id === local.id)
+            if (at >= 0) next[at] = { ...next[at], id: saved.id, text: saved.text || next[at].text, isPersonalRecord: saved.isPersonalRecord }
+          })
+          return next
+        })
+      }
+
+      for (const message of turn.messages.filter(item => item.type === 'agent')) {
+        if (message.text) pushMessage(message)
+      }
+    }
+
+    // A DM's conversation is created on its first message — tell the host so the
+    // left list can show it without a manual refresh.
+    if (isDM) onDmStarted?.()
+
+    // After a reply finishes, run anything that queued up while it streamed.
+    drainReadyQueue()
+  }
+
+  // Sealed batches waiting to run, in order. Drained one at a time so two
+  // visible reply runs never overlap (mirrors the backend single-run lock).
+  const readyQueueRef = useRef([])
+
+  const drainReadyQueue = () => {
+    if (turnInFlightRef.current) return
+    const next = readyQueueRef.current.shift()
+    if (!next) return
+    runCollectedTurn(next)   // sets the in-flight flag; calls drainReadyQueue again when done
+  }
+
+  const sealCurrentBatch = () => {
+    if (collectTimerRef.current) { window.clearTimeout(collectTimerRef.current); collectTimerRef.current = null }
+    if (!collectRef.current) return
+    readyQueueRef.current.push(collectRef.current)
+    collectRef.current = null
+    idleLog(`➡️ queued batch | replyInFlight=${turnInFlightRef.current} | queueLen=${readyQueueRef.current.length}`)
+    drainReadyQueue()
+  }
+
+  // The whole reply-timing mechanism: fire only once the user has gone quiet —
+  // no input activity for IDLE_MS and the input box empty — else re-check soon.
+  // (In-flight ordering is handled by the ready queue, not here.)
+  const armIdleCheck = () => {
+    if (collectTimerRef.current) window.clearTimeout(collectTimerRef.current)
+    collectTimerRef.current = window.setTimeout(maybeFireCollected, IDLE_POLL_MS)
+  }
+
+  const maybeFireCollected = () => {
+    collectTimerRef.current = null
+    if (!collectRef.current) return
+    const quietFor = Date.now() - lastActivityRef.current
+    // Composing (IME preedit) or any committed draft text both count as "still
+    // typing" — never reply while the user is mid-word, even if the candidate
+    // list has been open silently past the idle window.
+    const stillTyping = isComposingRef.current || inputDraftRef.current.trim().length > 0
+    if (stillTyping || quietFor < IDLE_MS) {
+      armIdleCheck()
+      return
+    }
+    idleLog(`🔒 SEAL after ${quietFor}ms quiet | batch [${collectRef.current.texts.join(' | ')}]`)
+    sealCurrentBatch()
+  }
+
+  // A right-clicked bubble becomes a structured replyTo for the backend (it
+  // resolves the text by id; we send only id + who).
+  const buildReplyTo = (message) => {
+    if (!message?.id) return null
+    const agentRole = message.type === 'agent'
+      ? (message.agentId === 'bird' ? 'bird' : 'persona')
+      : 'user'
+    return { id: message.id, agentRole, agentId: message.agentId }
+  }
+
+  const queueCollectedMessage = (text) => {
     const mention = resolveMention(text)
     const timestamp = Date.now()
+    const gapSinceActivity = lastActivityRef.current ? timestamp - lastActivityRef.current : null
+    // Snippet shown above the sent bubble so the user sees what they replied to.
+    const quoted = quoting ? {
+      author: quoting.type === 'agent'
+        ? (agents.find(agent => agent.id === quoting.agentId)?.name || quoting.agentId)
+        : (isChinese ? '我' : 'Me'),
+      text: quoting.text || ''
+    } : null
+    // The snapshot + which batch index carries it ride along on replyTo so the
+    // backend can persist the quote chip on the right message.
+    const batchIndex = collectRef.current ? collectRef.current.texts.length : 0
+    const replyTo = quoting ? { ...buildReplyTo(quoting), snapshot: quoted, index: batchIndex } : null
+
     setInput('')
+    inputDraftRef.current = ''
+    lastActivityRef.current = timestamp   // the send itself starts the idle clock
     setMentionOpen(false)
     setMentionQuery('')
     setMentionIndex(0)
     rememberUserMessage(text, timestamp)
 
-    if (!mention && !activeAgentId) {
-      const memoMessage = pushMessage({ type: 'memo', text, createdAt: timestamp })
-      persistMessage(memoMessage)
-      return
-    }
+    // Each send is its own bubble (like a real chat). Batching is purely
+    // time-based: every message sent within the idle window joins one batch and
+    // is read as a single expression — no @-target ever splits it. The backend
+    // routes the combined text, so a batch may go to one persona, several, or be
+    // ambient. We track only the latest explicit @ to focus the UI.
+    const localUserMessage = mention
+      ? pushMessage({ type: 'user', text, read: true, createdAt: timestamp, quoted })
+      : pushMessage({ type: 'user', text, isPersonalRecord: true, createdAt: timestamp, quoted })
 
-    const userMessage = { type: 'user', text, read: true, createdAt: timestamp }
-    const savedUserMessage = pushMessage(userMessage)
-    persistMessage(savedUserMessage)
-    const conversationWithUserMessage = [...messages, userMessage]
-
-    if (mention === 'all') {
-      setActiveAgentId(null)
-      for (const agent of agents) {
-        await replyAsAgent(agent, null, conversationWithUserMessage)
-        await sleep(850)
+    const wasOpen = !!collectRef.current
+    if (collectRef.current) {
+      collectRef.current.texts.push(text)
+      collectRef.current.localMessages.push(localUserMessage)
+      if (mention) collectRef.current.mention = mention
+      if (replyTo) collectRef.current.replyTo = replyTo
+    } else {
+      collectRef.current = {
+        texts: [text],
+        mention,
+        replyTo,
+        localMessages: [localUserMessage],
+        baseMessages: messages
       }
-      return
     }
-
-    if (mention === 'bird') {
-      setActiveAgentId(null)
-      await handleBirdAdmin(text)
-      return
-    }
-
-    const nextAgent = agents.find(agent => agent.id === mention) || agents.find(agent => agent.id === activeAgentId)
-    if (!nextAgent) return
-    setActiveAgentId(nextAgent.id)
-    await replyAsAgent(nextAgent, null, conversationWithUserMessage)
+    if (quoting) setQuoting(null)
+    idleLog(`📤 send "${text}" | gap since last activity ${gapSinceActivity ?? 'n/a'}ms | ${wasOpen ? `JOINED batch (now ${collectRef.current.texts.length})` : 'started NEW batch'} | mention=${mention || 'none'}`)
+    armIdleCheck()
   }
 
-  const moveAgent = (agentId, direction) => {
-    const index = agents.findIndex(agent => agent.id === agentId)
-    const target = index + direction
-    if (index < 0 || target < 0 || target >= agents.length) return
-    const next = [...agents]
-    ;[next[index], next[target]] = [next[target], next[index]]
-    setAgents(next)
-    savePlanetMemberPersonas(planetConfig, next).catch(error => console.warn('Failed to save Planet member order:', error))
+  const handleSend = async () => {
+    const text = input.trim()
+    if (!text) return
+    queueCollectedMessage(text)   // never blocks; batches/queues instead of erroring
   }
 
   const removeAgent = (agentId) => {
@@ -425,84 +942,147 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en' })
   }
 
   const openSettings = () => {
-    setSettingsDraft({ name: planet.name })
+    setSettingsDraft({ name: planet.groupName || planet.name })
+    setNameEditing(false)
     setSettingsOpen(true)
   }
 
   const closeSettings = () => {
-    setSettingsDraft({ name: planet.name })
+    setSettingsDraft({ name: planet.groupName || planet.name })
+    setNameEditing(false)
     setSettingsOpen(false)
   }
 
-  const saveSettings = () => {
-    const nextName = settingsDraft.name.trim() || (isChinese ? '未命名星球' : 'Untitled Planet')
-    savePlanetMeta(planet.id, { roomName: nextName, cardTitle: nextName })
-    updateChirpPlanet(planet, { roomName: nextName }).catch(error => {
-      console.warn('Failed to save Planet to Supabase:', error)
-    })
-    setPlanet(prev => ({ ...prev, name: nextName }))
-    setSettingsOpen(false)
+  // Edit/Save toggle for the GROUP CHAT name only. The group name lives on the
+  // conversation (and a separate planet-meta field) — it is NOT the planet name,
+  // so renaming the group never touches the planet/folder name.
+  const startNameEdit = () => {
+    setSettingsDraft({ name: planet.groupName || planet.name })
+    setNameEditing(true)
+  }
+
+  const commitName = () => {
+    const nextName = settingsDraft.name.trim() || (planet.groupName || planet.name)
+    setPlanet(prev => ({ ...prev, groupName: nextName }))          // header
+    savePlanetMeta(planet.id, { groupName: nextName })             // sidebar group child (via event) + local persist
+    updateChirpConversationTitle(planet.conversationId || planetConfig.conversationId, nextName).catch(() => {})
+    setSettingsDraft({ name: nextName })
+    setNameEditing(false)
   }
 
   return (
     <div className="chirp-page" style={{ '--chirp-paper': planet.background }}>
+      {IDLE_DEBUG && (
+        <div style={{ position: 'fixed', left: 8, bottom: 8, zIndex: 9999, width: 'min(94vw, 600px)', maxHeight: '42vh', overflowY: 'auto', background: 'rgba(0,0,0,0.85)', color: '#7CFC00', font: '11px/1.45 ui-monospace, Menlo, Consolas, monospace', padding: '8px 10px', borderRadius: 8, whiteSpace: 'pre-wrap' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4, color: '#fff' }}>
+            <b>idle debug · IDLE_MS={IDLE_MS}</b>
+            <span>
+              <button onClick={() => { navigator.clipboard?.writeText(idleEvents.join('\n')); showToast(isChinese ? '日志已复制' : 'Log copied') }} style={{ background: '#2a6', color: '#fff', border: 'none', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', marginRight: 6 }}>copy</button>
+              <button onClick={() => setIdleEvents([])} style={{ background: '#444', color: '#fff', border: 'none', borderRadius: 4, padding: '2px 8px', cursor: 'pointer' }}>clear</button>
+            </span>
+          </div>
+          {idleEvents.length === 0
+            ? <div style={{ color: '#888' }}>发条消息看这里……（📤=发送 ⌨️=停顿后又打字 🔒=封批 ➡️=入队）</div>
+            : idleEvents.map((line, i) => <div key={i}>{line}</div>)}
+        </div>
+      )}
       <div className="chirp-shell">
         <header className="chirp-topbar">
-          <button className="chirp-back" aria-label={isChinese ? '返回' : 'Back'} onClick={onBack}>
-            <svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6" /></svg>
-          </button>
-          <button className="chirp-group-title" onClick={openSettings}><span>{planet.name} ({memberCount})</span></button>
-          <button className="chirp-more" onClick={openSettings} aria-label={isChinese ? '群聊设置' : 'Group settings'}>
-            <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.7" /><circle cx="12" cy="12" r="1.7" /><circle cx="19" cy="12" r="1.7" /></svg>
-          </button>
+          {onBack && (
+            <button className="chirp-back" aria-label={isChinese ? '返回' : 'Back'} onClick={onBack}>
+              <svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6" /></svg>
+            </button>
+          )}
+          {isDM
+            ? <span className="chirp-group-title chirp-dm-title">{dmAgent.name}</span>
+            : <button className="chirp-group-title" onClick={openSettings}><span>{(planet.groupName || planet.name)} ({memberCount})</span></button>}
+          {!isDM && (
+            <button className="chirp-more" onClick={openSettings} aria-label={isChinese ? '群聊设置' : 'Group settings'}>
+              <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.7" /><circle cx="12" cy="12" r="1.7" /><circle cx="19" cy="12" r="1.7" /></svg>
+            </button>
+          )}
         </header>
 
         <main className={`chirp-main ${settingsOpen ? 'settings-open' : ''}`}>
           <section className="chirp-chat">
-            <div className="chirp-timeline" ref={timelineRef}>
-              <div className="chirp-date">{isChinese ? '今天' : 'Today'} {formatMessageTime(new Date())}</div>
-              {messages.map(message => <MessageBubble key={message.id} message={message} agents={agents} bird={bird} language={language} />)}
+            <div className="chirp-timeline" ref={timelineRef} onScroll={handleTimelineScroll}>
+              {loadingOlder && <div className="chirp-history-loading">{isChinese ? '加载更早的消息…' : 'Loading earlier messages…'}</div>}
+              {messages.map((message, index) => {
+                // WeChat-style time separator: before the first dated message, on a
+                // day change, or after a gap > 5 min from the previous one.
+                const prev = messages[index - 1]
+                const showSeparator = message.type !== 'system' && !!message.createdAt && (
+                  !prev
+                  || !prev.createdAt
+                  || (message.createdAt - prev.createdAt) > 5 * 60 * 1000
+                  || new Date(message.createdAt).toDateString() !== new Date(prev.createdAt).toDateString()
+                )
+                return (
+                  <Fragment key={message.id}>
+                    {showSeparator && <div className="chirp-date">{formatChatSeparator(message.createdAt, language)}</div>}
+                    <MessageBubble message={message} agents={agents} bird={bird} language={language} onQuote={startQuote} onOpenPersona={onOpenPersona} isDM={isDM} />
+                  </Fragment>
+                )
+              })}
+              {Object.entries(streamingReplies).map(([index, entry]) => (
+                <StreamingBubble key={`stream-${index}`} agent={[...agents, bird].find(agent => agent.id === entry.agentId)} text={entry.text} isDM={isDM} />
+              ))}
               {typingAgentId && <TypingBubble agent={[...agents, bird].find(agent => agent.id === typingAgentId)} />}
+              {typingAgentIds.map(agentId => <TypingBubble key={agentId} agent={[...agents, bird].find(agent => agent.id === agentId)} />)}
             </div>
 
             <footer className="chirp-composer">
-              <div className="chirp-input-row">
-                <button className="chirp-upload-button" type="button" aria-label={isChinese ? '上传图片' : 'Upload image'} onClick={() => fileInputRef.current?.click()}>+</button>
+              <div className="chirp-composer-box">
                 <input ref={fileInputRef} className="chirp-file-input" type="file" accept="image/*" onChange={handleUploadFile} />
-                <div className="chirp-input-shell">
-                  <textarea
-                    rows="1"
-                    value={input}
-                    onChange={(event) => updateInput(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter' && !event.shiftKey) {
-                        if (mentionOpen && filteredMentionItems.length > 0) {
-                          event.preventDefault()
-                          insertMention(filteredMentionItems[mentionIndex])
-                          return
-                        }
+                {quoting && (
+                  <div className="chirp-quote-bar">
+                    <div className="chirp-quote-bar-text">
+                      <span className="chirp-quote-bar-author">{quoting.type === 'agent' ? (agents.find(a => a.id === quoting.agentId)?.name || quoting.agentId) : (isChinese ? '我' : 'Me')}: </span>
+                      <span className="chirp-quote-bar-snippet">{quoting.text || ''}</span>
+                    </div>
+                    <button className="chirp-quote-bar-close" onClick={() => setQuoting(null)} aria-label={isChinese ? '取消引用' : 'Cancel quote'}>×</button>
+                  </div>
+                )}
+                <textarea
+                  ref={textareaRef}
+                  className="chirp-composer-textarea"
+                  rows="1"
+                  value={input}
+                  onChange={(event) => updateInput(event.target.value)}
+                  onCompositionStart={handleCompositionStart}
+                  onCompositionUpdate={markInputActivity}
+                  onCompositionEnd={handleCompositionEnd}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' && !event.shiftKey) {
+                      if (mentionOpen && filteredMentionItems.length > 0) {
                         event.preventDefault()
-                        handleSend()
+                        insertMention(filteredMentionItems[mentionIndex])
+                        return
                       }
-                      if (mentionOpen && filteredMentionItems.length > 0 && event.key === 'ArrowDown') {
-                        event.preventDefault()
-                        setMentionIndex(index => (index + 1) % filteredMentionItems.length)
-                      }
-                      if (mentionOpen && filteredMentionItems.length > 0 && event.key === 'ArrowUp') {
-                        event.preventDefault()
-                        setMentionIndex(index => (index - 1 + filteredMentionItems.length) % filteredMentionItems.length)
-                      }
-                      if (mentionOpen && event.key === 'Escape') {
-                        event.preventDefault()
-                        setMentionOpen(false)
-                      }
-                    }}
-                    placeholder={isChinese ? '@ 开始对话' : '@ to start a conversation'}
-                  />
+                      event.preventDefault()
+                      handleSend()
+                    }
+                    if (mentionOpen && filteredMentionItems.length > 0 && event.key === 'ArrowDown') {
+                      event.preventDefault()
+                      setMentionIndex(index => (index + 1) % filteredMentionItems.length)
+                    }
+                    if (mentionOpen && filteredMentionItems.length > 0 && event.key === 'ArrowUp') {
+                      event.preventDefault()
+                      setMentionIndex(index => (index - 1 + filteredMentionItems.length) % filteredMentionItems.length)
+                    }
+                    if (mentionOpen && event.key === 'Escape') {
+                      event.preventDefault()
+                      setMentionOpen(false)
+                    }
+                  }}
+                  placeholder={isChinese ? '@ 开始对话' : '@ to start a conversation'}
+                />
+                <div className="chirp-composer-bar">
+                  <button className="chirp-upload-button" type="button" aria-label={isChinese ? '上传图片' : 'Upload image'} onClick={() => fileInputRef.current?.click()}>+</button>
+                  <button className="chirp-send" onClick={handleSend} aria-label={isChinese ? '发送' : 'Send'}>
+                    <svg viewBox="0 0 24 24"><path d="m5 12 7-7 7 7" /><path d="M12 19V5" /></svg>
+                  </button>
                 </div>
-                <button className="chirp-send" onClick={handleSend} aria-label={isChinese ? '发送' : 'Send'}>
-                  <svg viewBox="0 0 24 24"><path d="m5 12 7-7 7 7" /><path d="M12 19V5" /></svg>
-                </button>
                 {mentionOpen && filteredMentionItems.length > 0 && (
                   <div className="chirp-mention-menu">
                     {filteredMentionItems.map((item, index) => (
@@ -530,60 +1110,57 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en' })
           {settingsOpen && <button className="chirp-settings-scrim" type="button" aria-label={isChinese ? '关闭设置' : 'Close settings'} onClick={closeSettings} />}
 
           <aside className="chirp-settings">
-            <div className="chirp-settings-head">
-              <button onClick={closeSettings} aria-label={isChinese ? '关闭设置' : 'Close settings'}>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
-              </button>
-            </div>
-
-            <section className="chirp-room-profile">
-              <div className="chirp-room-profile-inner">
-                <div className="chirp-room-avatar"><RoomAvatar /></div>
-                <input className="chirp-room-name-input" value={settingsDraft.name} onChange={(event) => setSettingsDraft(prev => ({ ...prev, name: event.target.value }))} aria-label={isChinese ? '群聊名称' : 'Group name'} />
-              </div>
-            </section>
-
             <div className="chirp-settings-body">
               <section>
                 <h3>{isChinese ? '成员' : 'Members'}</h3>
                 <div className="chirp-members-grid">
-                  {visibleMembers.map(member => (
-                    <div className="chirp-member" key={member.id}>
-                      <div className="chirp-member-avatar" style={{ backgroundColor: member.color }}><PersonaAvatar persona={member} /></div>
-                      <span>{member.name}</span>
-                    </div>
-                  ))}
-                  <button className="chirp-member-action" onClick={addPersonaFromCommunity} aria-label={isChinese ? '添加成员' : 'Add member'}><b>+</b></button>
-                  <button className="chirp-member-action" onClick={() => agents[agents.length - 1] && removeAgent(agents[agents.length - 1].id)} aria-label={isChinese ? '移除成员' : 'Remove member'}><b>-</b></button>
-                </div>
-              </section>
-
-              <section>
-                <h3>{isChinese ? '管理员' : 'Admin'}</h3>
-                <div className="chirp-admin-card">
-                  <div className="chirp-admin-avatar"><BIRD.avatar /></div>
-                  <div><strong>Bird</strong><p>{isChinese ? '仅在被提及执行管理任务时回复' : 'Only replies when mentioned for admin tasks'}</p></div>
-                </div>
-              </section>
-
-              <section>
-                <h3>{isChinese ? '@all 回复顺序' : '@all Order'}</h3>
-                <div className="chirp-agent-list">
-                  {agents.map((agent, index) => (
-                    <div className="chirp-agent-row" key={agent.id}>
-                      <div className="chirp-agent-avatar" style={{ backgroundColor: agent.color }}><PersonaAvatar persona={agent} /></div>
-                      <div><strong>{index + 1}. {agent.name}</strong><span>{agent.role}</span></div>
-                      <div className="chirp-agent-actions">
-                        <button onClick={() => moveAgent(agent.id, -1)}>↑</button>
-                        <button onClick={() => moveAgent(agent.id, 1)}>↓</button>
+                  {visibleMembers.map(member => {
+                    // A group needs at least 3 members, so removal is only offered
+                    // once we are above that floor; the user (self) is never removable.
+                    const removable = member.id !== 'user' && memberCount > 3
+                    return (
+                      <div className="chirp-member" key={member.id}>
+                        <div className="chirp-member-avatar-wrap">
+                          <div className="chirp-member-avatar" style={{ backgroundColor: member.color }}><PersonaAvatar persona={member} /></div>
+                          {removable && (
+                            <button
+                              type="button"
+                              className="chirp-member-remove"
+                              onClick={() => removeAgent(member.id)}
+                              aria-label={isChinese ? `移除 ${member.name}` : `Remove ${member.name}`}
+                            >−</button>
+                          )}
+                        </div>
+                        <span>{member.name}</span>
                       </div>
-                    </div>
-                  ))}
+                    )
+                  })}
+                  <button className="chirp-member-action" onClick={addPersonaFromCommunity} aria-label={isChinese ? '添加成员' : 'Add member'}><b>+</b></button>
+                </div>
+              </section>
+
+              <section>
+                <h3>{isChinese ? '群聊名称' : 'Group Name'}</h3>
+                <div className="chirp-group-name-row">
+                  <input
+                    className="chirp-group-name-input"
+                    value={nameEditing ? settingsDraft.name : (planet.groupName || planet.name)}
+                    onChange={(event) => setSettingsDraft({ name: event.target.value })}
+                    disabled={!nameEditing}
+                    placeholder={isChinese ? '群聊名称' : 'Group name'}
+                    aria-label={isChinese ? '群聊名称' : 'Group name'}
+                  />
+                  <button
+                    type="button"
+                    className="chirp-group-name-btn"
+                    onClick={nameEditing ? commitName : startNameEdit}
+                  >
+                    {nameEditing ? (isChinese ? '保存' : 'Save') : (isChinese ? '编辑' : 'Edit')}
+                  </button>
                 </div>
               </section>
             </div>
 
-            <div className="chirp-settings-footer"><button type="button" onClick={saveSettings}>{isChinese ? '保存' : 'Save'}</button></div>
           </aside>
         </main>
         {toast && <div className="chirp-toast">{toast}</div>}
@@ -592,15 +1169,39 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en' })
   )
 }
 
-function MessageBubble({ message, agents, bird, language }) {
+function MessageBubble({ message, agents, bird, language, onQuote, onOpenPersona, isDM }) {
   if (message.type === 'system') return null
-  if (message.type === 'memo') return <div className="chirp-message memo"><div className="chirp-bubble">{message.text}</div></div>
-  if (message.type === 'user') {
+  // A reply icon appears on hover (no right-click); clicking it quotes this
+  // bubble into the composer.
+  const replyButton = (
+    <button
+      type="button"
+      className="chirp-msg-reply"
+      onClick={() => onQuote?.(message)}
+      aria-label={language === 'zh' ? '引用回复' : 'Reply'}
+      title={language === 'zh' ? '引用回复' : 'Reply'}
+    >
+      <ReplyIcon />
+    </button>
+  )
+  // Personal records (memo) render exactly like normal user messages —
+  // the classification is backend-only (framework v2: 个人记录不做特殊 UI).
+  if (message.type === 'memo' || message.type === 'user') {
     return (
       <div className="chirp-message user">
         <div className="chirp-user-message-body">
-          <div className="chirp-bubble">{message.text}</div>
-          {!!message.tapbacks?.length && <div className="chirp-user-tapbacks">{message.tapbacks.map((tapback, index) => <span key={`${tapback}-${index}`}>{tapback}</span>)}</div>}
+          <div className="chirp-bubble-row">
+            {replyButton}
+            <div className="chirp-bubble-stack">
+              {message.quoted && (
+                <div className="chirp-quoted-ref">
+                  <span className="chirp-quoted-ref-author">{message.quoted.author}: </span>
+                  {message.quoted.text}
+                </div>
+              )}
+              <div className="chirp-bubble">{message.text}</div>
+            </div>
+          </div>
           {message.read && <span className="chirp-read-receipt">{formatMessageTime(new Date(message.createdAt))} {language === 'zh' ? '已读' : 'Read'}</span>}
         </div>
         <div className="chirp-user-side-avatar"><UserAvatar /></div>
@@ -610,11 +1211,32 @@ function MessageBubble({ message, agents, bird, language }) {
 
   const agent = [...agents, bird].find(item => item.id === message.agentId)
   if (!agent) return null
+  const openProfile = agent.id !== 'bird' && onOpenPersona ? () => onOpenPersona(agent.id) : undefined
   return (
     <div className="chirp-message agent">
-      <div className="chirp-agent-side-avatar" style={{ backgroundColor: agent.color }}><PersonaAvatar persona={agent} /></div>
-      <div className="chirp-agent-message-body"><span className="chirp-agent-name">{agent.name}</span><div className="chirp-bubble">{message.text}</div></div>
+      <div
+        className="chirp-agent-side-avatar"
+        style={{ backgroundColor: agent.color, cursor: openProfile ? 'pointer' : 'default' }}
+        onClick={openProfile}
+        role={openProfile ? 'button' : undefined}
+        title={openProfile ? agent.name : undefined}
+      ><PersonaAvatar persona={agent} /></div>
+      <div className="chirp-agent-message-body">
+        {!isDM && <span className="chirp-agent-name">{agent.name}</span>}
+        <div className="chirp-bubble-row">
+          <div className="chirp-bubble">{message.text}</div>
+          {replyButton}
+        </div>
+      </div>
     </div>
+  )
+}
+
+function ReplyIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
+    </svg>
   )
 }
 
@@ -624,6 +1246,23 @@ function TypingBubble({ agent }) {
     <div className="chirp-message agent">
       <div className="chirp-agent-side-avatar" style={{ backgroundColor: agent.color }}><PersonaAvatar persona={agent} /></div>
       <div className="chirp-agent-message-body"><div className="chirp-bubble typing"><i></i><i></i><i></i></div></div>
+    </div>
+  )
+}
+
+function StreamingBubble({ agent, text, isDM }) {
+  if (!agent || !text) return null
+  // Multi-bubble replies stream with ||| separators; render live as bubbles.
+  const parts = text.split(/\s*\|\|\|\s*/).filter(Boolean)
+  return (
+    <div className="chirp-message agent">
+      <div className="chirp-agent-side-avatar" style={{ backgroundColor: agent.color }}><PersonaAvatar persona={agent} /></div>
+      <div className="chirp-agent-message-body">
+        {!isDM && <span className="chirp-agent-name">{agent.name}</span>}
+        {parts.map((part, index) => (
+          <div className="chirp-bubble" key={index} style={index > 0 ? { marginTop: 6 } : undefined}>{part}</div>
+        ))}
+      </div>
     </div>
   )
 }

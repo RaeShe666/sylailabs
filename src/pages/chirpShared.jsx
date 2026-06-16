@@ -11,6 +11,24 @@ export const formatMessageTime = (date = new Date()) => (
   }).format(date)
 )
 
+// WeChat-style in-timeline separator: relative day + time, e.g. "14:45",
+// "昨天 14:45", "6月12日 14:45" (zh) / "Yesterday 14:45", "Jun 12 14:45" (en).
+export const formatChatSeparator = (timestamp, language = 'zh') => {
+  const date = new Date(timestamp)
+  const now = new Date()
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  const startOfYesterday = startOfToday - 24 * 60 * 60 * 1000
+  const value = date.getTime()
+  const hm = formatMessageTime(date)
+  if (value >= startOfToday) return hm
+  if (value >= startOfYesterday) return `${language === 'zh' ? '昨天' : 'Yesterday'} ${hm}`
+  const sameYear = date.getFullYear() === now.getFullYear()
+  const datePart = language === 'zh'
+    ? new Intl.DateTimeFormat('zh-CN', sameYear ? { month: 'long', day: 'numeric' } : { year: 'numeric', month: 'long', day: 'numeric' }).format(date)
+    : new Intl.DateTimeFormat('en-US', sameYear ? { month: 'short', day: 'numeric' } : { year: 'numeric', month: 'short', day: 'numeric' }).format(date)
+  return `${datePart} ${hm}`
+}
+
 export const formatActivityTime = (timestamp, fallback = '') => {
   if (!timestamp) return fallback
 
@@ -240,59 +258,46 @@ export const PersonaAvatar = ({ persona }) => {
 
 export const PERSONA_POOL = [
   {
-    id: 'lovebrain',
-    name: '恋爱脑',
-    role: '情绪雷达',
-    color: '#EBA7B5',
+    id: 'danzong',
+    name: '诞总',
+    role: '解构松弛',
+    color: '#E8A29C',
     avatar: CatAvatar,
-    emoji: '🙃',
+    emoji: '.',
     pricing: 'free',
-    usageCount: 449,
-    description: 'A warm but sharp emotional radar for reading romantic uncertainty without turning every small reply into a final verdict.',
-    systemPrompt: 'You are 恋爱脑. Read emotional temperature quickly, but do not invent facts. Reply like a sharp friend in a group chat.'
+    usageCount: 0,
+    description: 'A relaxed, anti-chicken-soup perspective inspired by public stand-up expression. Placeholder content for the persona machine.',
+    systemPrompt: 'You are 诞总, a relaxed friend who gently deconstructs overthinking without pretending to be any real person.'
   },
   {
-    id: 'strategist',
-    name: '军师',
-    role: '关系拆解',
+    id: 'barry',
+    name: 'Barry',
+    role: '共情陪伴',
+    color: '#EBA7B5',
+    avatar: RabbitAvatar,
+    emoji: '<3',
+    pricing: 'free',
+    usageCount: 0,
+    description: 'A placeholder companion voice for emotional landing and warmth in intimate relationship conversations.',
+    systemPrompt: 'You are Barry. First catch the user emotionally, then offer one grounded observation.'
+  },
+  {
+    id: 'duck',
+    name: 'duck',
+    role: '策略军师',
     color: '#A9C9DF',
     avatar: FoxAvatar,
-    emoji: '🫡',
+    emoji: '.',
     pricing: 'free',
-    usageCount: 389,
-    description: 'Separates facts, assumptions, evidence, and next moves. Useful when a relationship or work situation needs structure.',
-    systemPrompt: 'You are 军师. Separate facts, evidence, assumptions, and next moves. Reply calmly and directly.'
-  },
-  {
-    id: 'owl',
-    name: '夜航猫头鹰',
-    role: '边界观察',
-    color: '#B9A6D8',
-    avatar: OwlAvatar,
-    emoji: '🌙',
-    pricing: 'paid',
-    usageCount: 128,
-    description: 'A slower voice that watches boundaries, pacing, and the part of the user that needs a question before advice.',
-    systemPrompt: 'You are 夜航猫头鹰. Be slow, deep, and boundary-aware. Offer one grounded observation or one useful question.'
-  },
-  {
-    id: 'rabbit',
-    name: '软着陆',
-    role: '温柔承接',
-    color: '#A9CDA0',
-    avatar: RabbitAvatar,
-    emoji: '🐰',
-    pricing: 'free',
-    usageCount: 217,
-    description: 'A gentle landing voice for moments when the user needs to settle emotionally before analyzing what happened.',
-    systemPrompt: 'You are 软着陆. Help the user land emotionally before analysis. Gentle, not sugary.'
+    usageCount: 0,
+    description: 'A placeholder strategy voice that separates facts, assumptions, and next moves.',
+    systemPrompt: 'You are duck. Separate facts, assumptions, evidence, and next moves. Reply calmly and directly.'
   }
 ]
-
 export const BIRD = {
   id: 'bird',
   name: 'Bird',
-  role: 'Admin',
+  role: 'Observer',
   color: '#DCC4EA',
   avatar: BirdAvatar
 }
@@ -308,26 +313,11 @@ export const CHIRP_PLANETS = [
     background: '#FAFAF7',
     cardClass: 'love',
     avatar: CatAvatar,
-    agents: ['lovebrain', 'strategist'],
+    agents: ['danzong', 'barry', 'duck'],
     recent: 'You said you didn\'t mind...',
     time: '12:42'
-  },
-  {
-    id: 'work',
-    type: 'work',
-    name: '职场',
-    roomName: 'the suck odessy',
-    tone: 'work, career decisions, communication, conflict and planning',
-    color: '#A8C5DA',
-    background: '#FAFAF7',
-    cardClass: 'work',
-    avatar: FoxAvatar,
-    agents: ['strategist', 'owl'],
-    recent: 'About that deck yesterday...',
-    time: '09:18'
   }
 ]
-
 export const readPlanetMeta = () => readJson(PLANET_META_KEY, {})
 
 export const savePlanetMeta = (planetId, patch) => {
@@ -349,8 +339,10 @@ export const hydratePlanet = (planet) => {
   return {
     ...planet,
     ...meta,
-    roomName: meta.roomName || planet.roomName,
-    cardTitle: meta.cardTitle || meta.roomName || planet.cardTitle
+    roomName: meta.roomName || planet.roomName,           // planet (folder) name
+    cardTitle: meta.cardTitle || meta.roomName || planet.cardTitle,
+    // group chat name — separate from the planet name; defaults to the room name
+    groupName: meta.groupName || planet.groupName || meta.roomName || planet.roomName
   }
 }
 

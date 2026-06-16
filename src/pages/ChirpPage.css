@@ -26,8 +26,8 @@
   --chirp-control: #FFFFFF;
   --chirp-control-radius: 24px;
   --chirp-soft-shadow: 0 12px 30px rgba(24, 24, 27, 0.12);
-  --chirp-edge: 24px;
-  --chirp-avatar: 48px;
+  --chirp-edge: 20px;
+  --chirp-avatar: 38px;
   height: calc(100vh - 56px);
   min-height: 0;
   background: #FAFAF7;
@@ -49,8 +49,8 @@
 }
 
 .chirp-topbar {
-  height: 62px;
-  flex: 0 0 62px;
+  height: 54px;
+  flex: 0 0 54px;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -113,6 +113,29 @@
   white-space: nowrap;
 }
 
+.persona-test-title {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  justify-items: center;
+  line-height: 1.1;
+}
+
+.persona-test-title span {
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.persona-test-title small {
+  margin-top: 4px;
+  color: #8A8A8A;
+  font-size: 12px;
+}
+
 .chirp-avatar-svg {
   width: 100%;
   height: 100%;
@@ -164,6 +187,13 @@
   font-size: 13px;
 }
 
+.chirp-history-loading {
+  margin: 8px 0 2px;
+  text-align: center;
+  color: #A6A6AC;
+  font-size: 12px;
+}
+
 .chirp-system-note {
   width: fit-content;
   max-width: min(620px, 86%);
@@ -179,14 +209,14 @@
 .chirp-message {
   position: relative;
   width: 100%;
-  margin: 18px 0;
+  margin: 10px 0;
   display: flex;
 }
 
 .chirp-message.user {
   justify-content: flex-end;
   align-items: flex-start;
-  gap: 14px;
+  gap: 10px;
 }
 
 .chirp-message.memo {
@@ -196,22 +226,22 @@
 
 .chirp-message.agent {
   align-items: flex-start;
-  gap: 14px;
+  gap: 10px;
 }
 
 .chirp-bubble {
-  max-width: min(760px, calc(100vw - 150px));
-  padding: 16px 20px;
-  border-radius: 18px;
+  max-width: min(620px, calc(100vw - 150px));
+  padding: 9px 13px;
+  border-radius: 8px;
   font-size: 15px;
-  line-height: 1.4;
+  line-height: 1.45;
   word-break: break-word;
 }
 
 .chirp-message.user .chirp-bubble {
   background: #E8F1FF;
   color: var(--chirp-ink);
-  border-bottom-right-radius: 18px;
+  border-bottom-right-radius: 8px;
 }
 
 .chirp-user-message-body {
@@ -225,7 +255,7 @@
 .chirp-user-side-avatar {
   width: var(--chirp-avatar);
   height: var(--chirp-avatar);
-  border-radius: 999px;
+  border-radius: 8px;
   background: #EDEDEF;
   color: #5F5F66;
   display: grid;
@@ -237,19 +267,19 @@
 .chirp-message.memo .chirp-bubble {
   background: rgba(241, 241, 243, 0.95);
   color: #5F5F66;
-  border-radius: 18px;
+  border-radius: 8px;
   font-size: 14px;
 }
 
 .chirp-message.agent .chirp-bubble {
   background: var(--chirp-bubble-agent);
-  border-bottom-left-radius: 18px;
+  border-bottom-left-radius: 8px;
 }
 
 .chirp-agent-side-avatar {
   width: var(--chirp-avatar);
   height: var(--chirp-avatar);
-  border-radius: 16px;
+  border-radius: 8px;
   display: grid;
   place-items: center;
   flex: 0 0 auto;
@@ -268,34 +298,67 @@
   font-size: 13px;
 }
 
-.chirp-user-tapbacks {
-  position: absolute;
-  left: -14px;
-  top: -11px;
-  width: 28px;
-  height: 28px;
-  min-height: 0;
-  display: inline-flex;
+/* Bubble + hover reply icon. The icon sits beside the bubble (left of a user
+   bubble, right of an agent bubble) and only fades in on row hover. */
+.chirp-bubble-row {
+  display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 1px;
-  padding: 0;
-  border-radius: 999px;
-  background: rgba(245, 245, 247, 0.68);
-  border: 0;
-  box-shadow: 0 4px 12px rgba(24, 24, 27, 0.1);
-  backdrop-filter: blur(10px);
-  font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
-  font-size: 16px;
-  line-height: 1;
-  z-index: 2;
+  gap: 6px;
 }
 
-.chirp-user-tapbacks span {
-  min-width: 0;
-  display: inline-grid;
+.chirp-msg-reply {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #A6A6AC;
+  display: grid;
   place-items: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease, background 120ms ease, color 120ms ease;
 }
+
+.chirp-message:hover .chirp-msg-reply { opacity: 1; }
+.chirp-msg-reply:hover { background: #ECECEE; color: #5F5F66; }
+
+.chirp-msg-reply svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* Quoted snippet shown above a sent bubble (the line being replied to). Capped
+   to the bubble's max width; overflow is truncated with an ellipsis. */
+.chirp-bubble-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+  min-width: 0;
+}
+
+.chirp-quoted-ref {
+  max-width: min(620px, calc(100vw - 150px));
+  padding: 4px 10px;
+  border-radius: 7px;
+  background: rgba(120, 120, 128, 0.1);
+  color: #8A8A90;
+  font-size: 12px;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chirp-quoted-ref-author { color: #6E6E76; }
 
 .chirp-read-receipt {
   margin: 3px 4px 0 0;
@@ -345,53 +408,33 @@
   border-top: 0;
 }
 
-.chirp-input-row {
-  position: relative;
-  width: 100%;
-  margin: 0;
-  display: flex;
-  align-items: center;
-  gap: 14px;
-}
-
-.chirp-upload-button {
-  width: 54px;
-  height: 54px;
-  border: 0;
-  border-radius: 999px;
-  background: #F3F3F4;
-  color: #73737A;
-  font-size: 36px;
-  font-weight: 300;
-  line-height: 1;
-  cursor: pointer;
-  flex: 0 0 auto;
-}
-
 .chirp-file-input {
   display: none;
 }
 
-.chirp-input-shell {
-  flex: 1;
-  min-height: 54px;
+/* Codex-style composer: text on top, action row (+ left, send right) inside the
+   same rounded box at the bottom. */
+.chirp-composer-box {
+  position: relative;
+  width: 100%;
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 9px 9px 9px 22px;
-  border-radius: 999px;
-  background: #F3F3F4;
-  border: 0;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 18px;
+  background: #FFFFFF;
+  border: 1px solid #E6E6E8;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
 }
 
-.chirp-input-shell textarea {
-  flex: 1;
-  min-height: 25px;
-  max-height: 92px;
+.chirp-composer-textarea {
+  width: 100%;
+  min-height: 24px;
+  max-height: 160px;
   border: 0;
   outline: 0;
   resize: none;
-  padding: 0;
+  padding: 4px 6px 0;
   background: transparent;
   color: var(--chirp-ink);
   font: inherit;
@@ -399,26 +442,56 @@
   line-height: 1.5;
 }
 
-.chirp-input-shell textarea::placeholder {
+.chirp-composer-textarea::placeholder {
   color: #B6B6BC;
 }
 
-.chirp-send {
-  width: 54px;
-  height: 54px;
+.chirp-composer-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.chirp-upload-button {
+  width: 28px;
+  height: 28px;
   border: 0;
   border-radius: 999px;
-  background: #F3F3F4;
+  background: transparent;
   color: #73737A;
+  font-size: 18px;
+  font-weight: 300;
+  line-height: 1;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+}
+
+.chirp-upload-button:hover {
+  background: #F0F0F0;
+}
+
+.chirp-send {
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 999px;
+  background: #1F1F1F;
+  color: #FFFFFF;
   display: grid;
   place-items: center;
   cursor: pointer;
-  flex: 0 0 auto;
+}
+
+.chirp-send:disabled {
+  opacity: 0.4;
+  cursor: wait;
 }
 
 .chirp-send svg {
-  width: 26px;
-  height: 26px;
+  width: 15px;
+  height: 15px;
+  stroke-width: 2.2;
 }
 
 .chirp-mention-menu {
@@ -482,14 +555,14 @@
   right: 0;
   bottom: 0;
   z-index: 230;
-  width: min(400px, 92vw);
+  width: min(340px, 92vw);
   min-width: 0;
   display: flex;
   flex-direction: column;
   background: rgba(250, 250, 247, 0.98);
   border-left: 0;
   transform: translateX(100%);
-  transition: transform 180ms ease;
+  transition: transform 280ms ease;
 }
 
 .settings-open .chirp-settings {
@@ -503,41 +576,6 @@
   border: 0;
   background: rgba(18, 18, 18, 0.42);
   cursor: default;
-}
-
-.chirp-settings-head {
-  flex: 0 0 62px;
-  position: absolute;
-  top: 0;
-  right: 0;
-  z-index: 2;
-  height: 62px;
-  padding: 0 18px;
-  border-bottom: 0;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-}
-
-.chirp-settings-head button {
-  width: 40px;
-  height: 40px;
-  border: 0;
-  border-radius: 999px;
-  background: transparent;
-  cursor: pointer;
-  display: grid;
-  place-items: center;
-  color: var(--chirp-ink);
-}
-
-.chirp-settings-head button svg {
-  width: 24px;
-  height: 24px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 2;
-  stroke-linecap: round;
 }
 
 .chirp-settings-body {
@@ -600,8 +638,8 @@
 
 .chirp-members-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 15px 12px;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 14px 4px;
 }
 
 .chirp-member,
@@ -616,14 +654,42 @@
   text-align: center;
 }
 
+.chirp-member-avatar-wrap {
+  position: relative;
+  width: var(--chirp-avatar);
+  height: var(--chirp-avatar);
+}
+
 .chirp-member-avatar,
 .chirp-member-action b {
-  width: 58px;
-  height: 58px;
-  border-radius: 14px;
+  width: var(--chirp-avatar);   /* 38px — same as chat avatars */
+  height: var(--chirp-avatar);
+  border-radius: 8px;
   display: grid;
   place-items: center;
   overflow: hidden;
+}
+
+.chirp-member-remove {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 1.5px solid #FAFAF7;
+  border-radius: 50%;
+  background: #C3C3C8;
+  color: #fff;
+  font-size: 13px;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+
+.chirp-member-remove:hover {
+  background: #FF5A5A;
 }
 
 .chirp-member-action {
@@ -636,7 +702,7 @@
   border: 1.5px dashed #C3C3C8;
   background: #fff;
   color: #9A9AA1;
-  font-size: 30px;
+  font-size: 20px;
   font-weight: 300;
 }
 
@@ -738,42 +804,6 @@
   font-size: 12px;
 }
 
-.chirp-agent-actions {
-  display: flex;
-  gap: 5px;
-}
-
-.chirp-agent-actions button {
-  width: 28px;
-  height: 28px;
-  border: 0;
-  border-radius: 999px;
-  background: #F0F0F2;
-  color: #4B4B52;
-  cursor: pointer;
-}
-
-.chirp-settings-footer {
-  flex: 0 0 auto;
-  padding: 14px 20px 18px;
-  background: rgba(250, 250, 247, 0.98);
-  display: flex;
-  justify-content: center;
-}
-
-.chirp-settings-footer button {
-  width: min(240px, 100%);
-  height: 46px;
-  border: 0;
-  border-radius: 999px;
-  background: var(--chirp-ink);
-  color: #fff;
-  font: inherit;
-  font-size: 15px;
-  font-weight: 700;
-  cursor: pointer;
-}
-
 .chirp-toast {
   position: fixed;
   left: 50%;
@@ -820,3 +850,172 @@
   }
 
 }
+
+/* Quote/reply bar above the composer (right-click a bubble to quote it) */
+/* Quote chip lives inside the composer box, as an integrated row above the
+   textarea (separated by a hairline divider). */
+.chirp-quote-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 4px 7px;
+  margin: 0 0 6px;
+  border-bottom: 1px solid #EFEFEF;
+  font-size: 13px;
+}
+.chirp-quote-bar-text {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #333;
+}
+.chirp-quote-bar-author { font-weight: 700; color: #1f1f1f; }
+.chirp-quote-bar-snippet { color: #444; }
+.chirp-quote-bar-close {
+  flex-shrink: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: 20px;
+  line-height: 1;
+  color: #9a9a9a;
+  padding: 0 2px;
+}
+.chirp-quote-bar-close:hover { color: #555; }
+
+/* Persona profile (full-screen, reached by tapping a persona avatar) */
+.persona-profile-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--chirp-paper, #FAFAF7);
+}
+.persona-profile-topbar {
+  display: flex;
+  align-items: center;
+  padding: 10px 12px;
+}
+.persona-profile-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 24px;
+  text-align: center;
+}
+.persona-profile-avatar {
+  width: 96px;
+  height: 96px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+.persona-profile-avatar svg,
+.persona-profile-avatar img { width: 100%; height: 100%; }
+.persona-profile-name { margin: 4px 0 0; font-size: 22px; font-weight: 700; }
+.persona-profile-intro { margin: 0; max-width: 420px; color: #666; font-size: 15px; line-height: 1.5; }
+/* .persona-profile-message-btn shares the primary dark button spec below */
+.persona-profile-message-btn { margin-top: 10px; }
+
+/* Persistent two-pane chat: the existing drawer, docked left, + chat on the right */
+.chirp-two-pane {
+  display: flex;
+  height: calc(100vh - 56px);
+  min-height: 0;
+}
+.chirp-pane-main {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+}
+/* Docked variant of the existing planet drawer (reuses all its inner styling):
+   in normal flow instead of a sliding overlay. */
+.chirp-home-drawer.docked {
+  position: relative;
+  top: 0;
+  left: 0;
+  bottom: auto;
+  z-index: 1;
+  transform: none;
+  box-shadow: none;
+  border-right: 1px solid rgba(217, 217, 221, 0.45);
+  height: 100%;
+  width: clamp(264px, var(--drawer-width, 264px), 360px);
+  flex-shrink: 0;
+}
+.chirp-home-drawer .drawer-planet-card.active,
+.chirp-home-drawer .dm-card.active {
+  background: #E8F1FF;
+}
+
+@media (max-width: 768px) {
+  .chirp-two-pane { flex-direction: column; }
+  .chirp-home-drawer.docked {
+    width: 100%;
+    max-height: 38vh;
+    border-right: none;
+    border-bottom: 1px solid rgba(217, 217, 221, 0.45);
+  }
+}
+
+/* Conversation (Bird / persona DM) rows in the docked list */
+.chirp-home-drawer .dm-card-avatar {
+  border-radius: 8px;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+}
+.chirp-home-drawer .dm-card-avatar svg,
+.chirp-home-drawer .dm-card-avatar img { width: 100%; height: 100%; }
+
+/* Group Name field in settings: input + Edit/Save button on its right */
+.chirp-group-name-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.chirp-group-name-input {
+  flex: 1;
+  min-width: 0;
+  height: var(--chirp-avatar);
+  padding: 0 14px;
+  border: 1px solid #E0E0E2;
+  border-radius: 12px;
+  background: #FFFFFF;
+  font: inherit;
+  font-size: 15px;
+  color: var(--chirp-ink);
+  outline: none;
+  box-sizing: border-box;
+}
+.chirp-group-name-input:focus { border-color: #B9B9BD; }
+.chirp-group-name-input:disabled { background: #F5F5F6; color: var(--chirp-ink); -webkit-text-fill-color: var(--chirp-ink); cursor: default; }
+/* Primary dark button — one shared spec for every solid action button
+   (Edit/Save here, the persona profile Message button, etc.) */
+.chirp-group-name-btn,
+.persona-profile-message-btn {
+  flex: 0 0 auto;
+  height: var(--chirp-avatar);   /* 38px — same as inputs & avatars */
+  padding: 0 18px;
+  border: 0;
+  border-radius: 10px;
+  background: #1F1F1F;
+  color: #FFFFFF;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+}
+.chirp-group-name-btn:hover,
+.persona-profile-message-btn:hover { opacity: 0.9; }

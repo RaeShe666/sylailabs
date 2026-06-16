@@ -3,6 +3,7 @@ import {
   CHIRP_PLANETS,
   getAllPersonas,
   formatActivityTime,
+  getPersonasForPlanet,
   getPlanetRecent,
   hydratePlanet,
   truncateRecentMessage
@@ -33,6 +34,53 @@ const defaultPlanetPayload = (userId, planet) => ({
   tone: planet.tone,
   background: planet.background,
   avatar_key: planet.id
+})
+
+const BIRD_MEMBER = {
+  member_type: 'bird',
+  member_id: 'bird',
+  agent_role: 'bird',
+  listen_mode: 'mention_only',
+  position: 1
+}
+
+const toClientMessage = (row) => ({
+  id: row.id,
+  type: row.sender_type,
+  agentId: row.sender_type === 'agent' ? row.sender_id : undefined,
+  text: row.text || '',
+  tapbacks: Array.isArray(row.tapbacks) ? row.tapbacks : [],
+  read: row.sender_type === 'user',
+  isPersonalRecord: row.is_personal_record || row.sender_type === 'memo',
+  createdAt: row.created_at ? new Date(row.created_at).getTime() : Date.now()
+})
+
+const toClientPersona = (row) => ({
+  id: row.persona_key || row.id,
+  dbId: row.id,
+  personaKey: row.persona_key || null,
+  name: row.name,
+  role: row.role || 'custom persona',
+  description: row.description || 'A custom persona created by you for private Planet conversations.',
+  systemPrompt: row.system_prompt || '',
+  skills: row.skills || '',
+  avatarUrl: row.avatar_url || '',
+  color: row.color || '#F5C878',
+  pricing: row.pricing || 'free',
+  usageCount: row.usage_count || 0,
+  isOfficial: row.is_official || false,
+  identity: row.identity || {},
+  relationship: row.relationship || {},
+  voice_style: row.voice_style || {},
+  boundaries: row.boundaries || {},
+  reply_policy: row.reply_policy || {},
+  memory_policy: row.memory_policy || {},
+  examples: Array.isArray(row.examples) ? row.examples : [],
+  lane_contract: row.lane_contract || {},
+  agent_role: row.agent_role || 'persona',
+  listen_mode: row.listen_mode || 'passive',
+  metadata: row.metadata || {},
+  createdAt: row.created_at ? new Date(row.created_at).getTime() : Date.now()
 })
 
 export async function loadChirpProfile(user) {
@@ -89,8 +137,10 @@ export async function loadChirpPlanets(user) {
 
   const existing = []
   const seenTypes = new Set()
+  const supportedTypes = new Set(CHIRP_PLANETS.map(planet => planet.id))
   ;(data || []).forEach(row => {
     const key = row.type || row.id
+    if (!supportedTypes.has(key)) return
     if (seenTypes.has(key)) return
     seenTypes.add(key)
     existing.push(row)
@@ -112,10 +162,113 @@ export async function loadChirpPlanets(user) {
       .order('created_at', { ascending: true })
 
     if (refreshError) throw refreshError
-    return (refreshed || []).map(toClientPlanet)
+    const planets = (refreshed || [])
+      .filter(row => supportedTypes.has(row.type || row.id))
+      .map(toClientPlanet)
+    return Promise.all(planets.map(planet => ensureChirpConversations(user, planet)))
   }
 
-  return existing.map(toClientPlanet)
+  const planets = existing.map(toClientPlanet)
+  return Promise.all(planets.map(planet => ensureChirpConversations(user, planet)))
+}
+
+export async function ensureChirpConversations(user, planet, agents = getPersonasForPlanet(planet)) {
+  if (!user || !planet?.dbId) return planet
+
+  const groupConversation = await ensureConversation({
+    userId: user.id,
+    planetId: planet.dbId,
+    type: 'group',
+    title: planet.roomName || planet.name || 'relationship'
+  })
+
+  await ensureConversation({
+    userId: user.id,
+    planetId: null,
+    type: 'bird_dm',
+    title: 'Bird'
+  })
+
+  if (groupConversation?.id) {
+    await ensureConversationMembers(groupConversation.id, [
+      {
+        member_type: 'user',
+        member_id: user.id,
+        agent_role: 'user',
+        listen_mode: 'active',
+        position: 0
+      },
+      BIRD_MEMBER,
+      ...agents.map((agent, index) => ({
+        member_type: 'persona',
+        member_id: agent.id,
+        persona_id: /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(agent.id) ? agent.id : null,
+        agent_role: 'persona',
+        listen_mode: 'passive',
+        position: index + 2
+      }))
+    ])
+  }
+
+  return {
+    ...planet,
+    conversationId: groupConversation?.id || planet.conversationId
+  }
+}
+
+async function ensureConversation({ userId, planetId, type, title }) {
+  const findExisting = async () => {
+    let query = supabase
+      .from('chirp_conversations')
+      .select('*')
+      .eq('owner_id', userId)
+      .eq('type', type)
+      .order('created_at', { ascending: true })   // earliest wins → stable across duplicate rows
+      .limit(1)
+    query = planetId === null ? query.is('planet_id', null) : query.eq('planet_id', planetId)
+    const { data, error } = await query.maybeSingle()
+    if (error) throw error
+    return data
+  }
+
+  const existing = await findExisting()
+  if (existing) return existing
+
+  const { data, error } = await supabase
+    .from('chirp_conversations')
+    .insert({ owner_id: userId, planet_id: planetId, type, title })
+    .select()
+    .single()
+
+  // Lost the create race (unique index) — re-find the winning row.
+  if (error?.code === '23505') {
+    const raced = await findExisting()
+    if (raced) return raced
+  }
+  if (error) throw error
+  return data
+}
+
+async function ensureConversationMembers(conversationId, members) {
+  if (!conversationId || !members.length) return []
+
+  const rows = members.map(member => ({
+    conversation_id: conversationId,
+    member_type: member.member_type,
+    member_id: member.member_id,
+    persona_id: member.persona_id || null,
+    agent_role: member.agent_role || member.member_type,
+    listen_mode: member.listen_mode || 'passive',
+    position: member.position || 0
+  }))
+
+  const { data, error } = await supabase
+    .from('chirp_conversation_members')
+    .upsert(rows, { onConflict: 'conversation_id,member_type,member_id' })
+    .select()
+
+  if (error) throw error
+  return data || []
 }
 
 export async function updateChirpPlanet(planet, patch) {
@@ -140,26 +293,76 @@ export async function updateChirpPlanet(planet, patch) {
   return toClientPlanet(data)
 }
 
-export async function loadChirpMessages(planet) {
-  if (!planet?.dbId) return null
+// How many messages to load per page (initial open + each scroll-up fetch).
+export const HISTORY_PAGE_SIZE = 100
 
+// Fetch the most recent `limit` messages for a filter, returned in ascending
+// (display) order. `hasMore` is true when a full page came back — i.e. there may
+// be older messages to load when the user scrolls up.
+async function fetchRecentMessages(column, value, limit) {
   const { data, error } = await supabase
     .from('chirp_messages')
     .select('*')
-    .eq('planet_id', planet.dbId)
-    .order('created_at', { ascending: true })
-
+    .eq(column, value)
+    .order('created_at', { ascending: false })
+    .limit(limit)
   if (error) throw error
+  const rows = data || []
+  return { messages: rows.slice().reverse().map(toClientMessage), hasMore: rows.length === limit }
+}
 
-  return (data || []).map(row => ({
-    id: row.id,
-    type: row.sender_type,
-    agentId: row.sender_type === 'agent' ? row.sender_id : undefined,
-    text: row.text || '',
-    tapbacks: Array.isArray(row.tapbacks) ? row.tapbacks : [],
-    read: row.sender_type === 'user',
-    createdAt: row.created_at ? new Date(row.created_at).getTime() : Date.now()
-  }))
+// Returns { messages, hasMore }. Loads only the most recent page so opening a
+// long conversation is fast and lands on the latest message.
+export async function loadChirpMessages(planet, limit = HISTORY_PAGE_SIZE) {
+  if (!planet?.dbId) return { messages: [], hasMore: false }
+  if (planet.conversationId) return fetchRecentMessages('conversation_id', planet.conversationId, limit)
+  return fetchRecentMessages('planet_id', planet.dbId, limit)
+}
+
+// Older page for "scroll up to load more": messages strictly before
+// `beforeCreatedAt` (the oldest message currently on screen). Returns
+// { messages, hasMore } with messages in ascending order, ready to prepend.
+export async function loadOlderChirpMessages({ conversationId, planetId, beforeCreatedAt, limit = HISTORY_PAGE_SIZE }) {
+  const column = conversationId ? 'conversation_id' : 'planet_id'
+  const value = conversationId || planetId
+  if (!value || !beforeCreatedAt) return { messages: [], hasMore: false }
+  const { data, error } = await supabase
+    .from('chirp_messages')
+    .select('*')
+    .eq(column, value)
+    .lt('created_at', beforeCreatedAt)
+    .order('created_at', { ascending: false })
+    .limit(limit)
+  if (error) {
+    console.warn('Failed to load older messages:', error)
+    return { messages: [], hasMore: false }
+  }
+  const rows = data || []
+  return { messages: rows.slice().reverse().map(toClientMessage), hasMore: rows.length === limit }
+}
+
+// DM history, loaded strictly by conversation id (never by planet) so a DM
+// never picks up a planet's group messages.
+// Group chat name lives on the conversation (title), separate from the planet
+// name. RLS lets the owner update their own conversation.
+export async function updateChirpConversationTitle(conversationId, title) {
+  if (!conversationId || !title) return
+  const { error } = await supabase
+    .from('chirp_conversations')
+    .update({ title })
+    .eq('id', conversationId)
+  if (error) console.warn('Failed to update conversation title:', error)
+}
+
+// Returns { messages, hasMore }. Loads only the most recent page.
+export async function loadChirpMessagesByConversation(conversationId, limit = HISTORY_PAGE_SIZE) {
+  if (!conversationId) return { messages: [], hasMore: false }
+  try {
+    return await fetchRecentMessages('conversation_id', conversationId, limit)
+  } catch (error) {
+    console.warn('Failed to load DM messages:', error)
+    return { messages: [], hasMore: false }
+  }
 }
 
 export async function saveChirpMessage(planet, message) {
@@ -167,8 +370,13 @@ export async function saveChirpMessage(planet, message) {
 
   const payload = {
     planet_id: planet.dbId,
+    conversation_id: planet.conversationId || null,
     sender_type: message.type,
     sender_id: message.agentId || (message.type === 'user' ? 'user' : null),
+    sender_role: message.type === 'agent'
+      ? (message.agentId === 'bird' ? 'bird' : 'persona')
+      : (message.type === 'user' ? 'user' : 'record'),
+    is_personal_record: Boolean(message.isPersonalRecord || message.type === 'memo'),
     text: message.text || '',
     tapbacks: message.tapbacks || []
   }
@@ -247,60 +455,57 @@ export async function saveChirpMomentEntry(planet, text, entryId, momentKey = 'd
   }
 }
 
-export async function loadChirpMomentAiEntries(planet, momentKey = 'default') {
-  if (!planet?.dbId) return []
+// The user's persona DMs, for the persistent conversation list. Read directly
+// (RLS scopes to the owner); each entry carries the persona id + last message.
+export async function loadChirpDmConversations(user) {
+  if (!user) return []
+  const { data: convs, error } = await supabase
+    .from('chirp_conversations')
+    .select('id,type,title,metadata,created_at')
+    .eq('owner_id', user.id)
+    .in('type', ['persona_dm', 'bird_dm'])
+  if (error || !convs?.length) return []
 
-  const { data, error } = await supabase
+  const ids = convs.map(conversation => conversation.id)
+  const { data: msgs } = await supabase
     .from('chirp_messages')
-    .select('*')
-    .eq('planet_id', planet.dbId)
-    .eq('sender_type', 'agent')
-    .eq('sender_id', `moment:${momentKey}:bird`)
-    .order('created_at', { ascending: true })
+    .select('conversation_id,text,created_at')
+    .in('conversation_id', ids)
+    .order('created_at', { ascending: false })
 
-  if (error) throw error
-
-  return (data || []).map(row => ({
-    id: row.id,
-    text: row.text || '',
-    createdAt: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
-    time: '小草 · now'
-  }))
-}
-
-export async function saveChirpMomentAiEntry(planet, text, momentKey = 'default') {
-  if (!planet?.dbId || !text?.trim()) return null
-
-  const { data, error } = await supabase
-    .from('chirp_messages')
-    .insert({
-      planet_id: planet.dbId,
-      sender_type: 'agent',
-      sender_id: `moment:${momentKey}:bird`,
-      text: text.trim(),
-      tapbacks: []
-    })
-    .select()
-    .single()
-
-  if (error) throw error
-  return {
-    id: data.id,
-    text: data.text || '',
-    createdAt: data.created_at ? new Date(data.created_at).getTime() : Date.now(),
-    time: '小草 · now'
+  const last = {}
+  for (const message of (msgs || [])) {
+    if (!last[message.conversation_id]) last[message.conversation_id] = message
   }
+
+  // Earliest conversation per agent wins (matches the backend's "earliest"
+  // resolution), so duplicate rows from past races collapse to one list entry.
+  const byAgent = new Map()
+  for (const conversation of [...convs].sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')))) {
+    const agentId = conversation.metadata?.agent_id || (conversation.type === 'bird_dm' ? 'bird' : null)
+    if (!agentId || byAgent.has(agentId)) continue
+    byAgent.set(agentId, {
+      conversationId: conversation.id,
+      agentId,
+      title: conversation.title,
+      lastText: last[conversation.id]?.text || '',
+      lastAt: last[conversation.id]?.created_at || null
+    })
+  }
+  return [...byAgent.values()].sort((a, b) => String(b.lastAt || '').localeCompare(String(a.lastAt || '')))
 }
 
 export async function loadPlanetActivityFromMessages(planets) {
   const dbIds = planets.map(planet => planet.dbId).filter(Boolean)
   if (!dbIds.length) return {}
 
+  // Last message of the conversation, ANY sender (user / memo / agent) — the
+  // list preview should match "the last line in the chat", like WeChat.
   const { data, error } = await supabase
     .from('chirp_messages')
     .select('planet_id,text,created_at,sender_type')
     .in('planet_id', dbIds)
-    .in('sender_type', ['user', 'memo'])
+    .neq('sender_type', 'system')
     .order('created_at', { ascending: false })
 
   if (error) throw error
@@ -329,28 +534,26 @@ export async function loadPlanetActivityFromMessages(planets) {
 export async function loadCustomPersonas(user) {
   if (!user) return []
 
+  // persona-v2: official personas are global public templates; using one
+  // creates a per-user instance server-side, nothing is copied per user.
   const { data, error } = await supabase
-    .from('chirp_personas')
-    .select('*')
-    .eq('creator_id', user.id)
-    .order('created_at', { ascending: false })
+    .from('chirp_persona_templates')
+    .select('id,persona_key,name,short_intro,avatar_url,color,creator_type,is_active')
+    .eq('visibility', 'public')
+    .eq('is_active', true)
+    .order('created_at', { ascending: true })
 
   if (error) throw error
 
-  return (data || []).map(row => ({
+  return (data || []).map(row => toClientPersona({
     id: row.id,
-    dbId: row.id,
+    persona_key: row.persona_key,
     name: row.name,
-    role: row.role || 'custom persona',
-    description: row.description || 'A custom persona created by you for private Planet conversations.',
-    systemPrompt: row.system_prompt || '',
-    skills: row.skills || '',
-    avatarUrl: row.avatar_url || '',
-    color: row.color || '#F5C878',
-    pricing: row.pricing || 'free',
-    usageCount: row.usage_count || 0,
-    isOfficial: row.is_official || false,
-    createdAt: row.created_at ? new Date(row.created_at).getTime() : Date.now()
+    role: row.short_intro,
+    description: row.short_intro,
+    avatar_url: row.avatar_url,
+    color: row.color,
+    is_official: row.creator_type === 'official'
   }))
 }
 

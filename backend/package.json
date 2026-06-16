@@ -4,9 +4,11 @@
     "type": "module",
     "scripts": {
         "start": "node server.js",
-        "dev": "node --watch server.js"
+        "dev": "node --watch server.js",
+        "test": "node --test"
     },
     "dependencies": {
+        "@anthropic-ai/sdk": "^0.104.1",
         "@supabase/supabase-js": "^2.91.0",
         "cors": "^2.8.5",
         "dotenv": "^17.2.3",

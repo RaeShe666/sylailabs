@@ -1,5 +1,7 @@
 # Chirp 开发交接备忘（for Codex）
 
+> ⚠️ **2026-06-10 更新**：本备忘对应旧 M1 优先级。persona 部分已由《chirp-persona-技术路线-v2》取代（template/instance 拆分、runtime 三层、记忆 L0/L1）；当前 P0 = 先把诞总做到任何用户都能用（persona-v2 §0）。冲突处以 persona-v2 为准。
+
 > 这份文件是给接手开发的 agent（Codex）的**自包含上下文**。读完它 + 下面两个源文档，就能开始写 M1，不需要更多背景。
 > 写于 2026-05-30。
 >
