@@ -40,13 +40,13 @@ test('buildSystemBlocks puts bases + runtime card in the cacheable stable layer 
   assert.match(blocks[1].text, /directness/)
 })
 
-test('ambient mode adds the silence option and fallback mode forbids it', () => {
+test('ambient mode adds the silence option and fallback modes are not supported', () => {
   const ambientBlocks = buildSystemBlocks({ template: TEMPLATE, mode: 'ambient' })
   assert.match(ambientBlocks[1].text, /\[SILENCE\]/)
   assert.match(ambientBlocks[1].text, /starting point is always the user/)
 
   const fallbackBlocks = buildSystemBlocks({ template: TEMPLATE, mode: 'ambient_fallback' })
-  assert.match(fallbackBlocks[1].text, /fallback/i)
+  assert.doesNotMatch(fallbackBlocks[1].text, /fallback|left hanging/i)
   assert.ok(!fallbackBlocks[1].text.includes('[SILENCE]'))
 
   const mentionedBlocks = buildSystemBlocks({ template: TEMPLATE })
@@ -138,6 +138,59 @@ test('runPersona responds to the latest no-@ (memo) message instead of the prior
   // to background — not re-answered.
   assert.match(captured, /Current user message[\s\S]*你还真是像我的恋爱脑朋友/)
   assert.ok(!/Current user message[\s\S]*你说的是指哪句话/.test(captured))
+})
+
+test('runPersona uses the full current user turn when provided', async () => {
+  let captured = null
+  await runPersona({
+    template: TEMPLATE,
+    instance: INSTANCE,
+    planet: { name: '恋爱' },
+    user: { nickname: '' },
+    members: [{ name: 'Barry', role: 'persona' }],
+    messages: [
+      { id: 'm1', type: 'user', text: '第一条' },
+      { id: 'm2', type: 'user', text: '第二条' },
+      { id: 'm3', type: 'user', text: '第三条' }
+    ],
+    currentUserText: '第一条\n第二条\n第三条',
+    currentMessageIds: ['m1', 'm2', 'm3'],
+    memoryScope: { type: 'persona_membership_planet' },
+    recallTool: async () => ({ summary: 'NONE' }),
+    turn: async ({ messages }) => {
+      captured = messages[0].content
+      return { text: '收到', toolCalls: [], stopReason: 'end_turn' }
+    }
+  })
+
+  assert.match(captured, /Current user message[\s\S]*第一条\n第二条\n第三条/)
+  assert.match(captured, /Recent background before the latest message:\nNONE/)
+})
+
+test('runPersona never switches into emoji-only reaction mode', async () => {
+  let captured = null
+  await runPersona({
+    template: TEMPLATE,
+    instance: INSTANCE,
+    planet: { name: '恋爱' },
+    user: { nickname: '' },
+    members: [{ name: 'Barry', role: 'persona' }],
+    messages: [
+      { id: 'm1', type: 'user', text: '你确定现在是凌晨3点？' }
+    ],
+    currentUserText: '你确定现在是凌晨3点？',
+    currentMessageIds: ['m1'],
+    mode: 'emoji_reaction',
+    memoryScope: { type: 'persona_membership_planet' },
+    recallTool: async () => ({ summary: 'NONE' }),
+    turn: async ({ messages }) => {
+      captured = messages[0].content
+      return { text: '不是，我看错时间了。', toolCalls: [], stopReason: 'end_turn' }
+    }
+  })
+
+  assert.match(captured, /Current user message/)
+  assert.doesNotMatch(captured, /EXACTLY ONE emoji|No one is replying in words/)
 })
 
 test('formatQuoted surfaces the quoted message, empty when none', () => {

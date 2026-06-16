@@ -64,11 +64,11 @@ export function mergeRankedLists(lists, limit = 5) {
     .map(({ item, score }) => ({ ...item, score }))
 }
 
-export function formatRecallForPrompt(recallResult) {
+export function formatRecallForPrompt(recallResult, tzOffset = null) {
   if (!recallResult?.items?.length) return 'NONE'
   return recallResult.items
     .map(item => {
-      const at = formatAbsTime(item.created_at)
+      const at = formatAbsTime(item.created_at, tzOffset)
       const stamp = at ? `[${at}] ` : ''
       return `- ${stamp}${item.sender_type}${item.sender_id ? `(${item.sender_id})` : ''}: ${item.text}`
     })

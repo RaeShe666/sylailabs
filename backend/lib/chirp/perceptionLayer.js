@@ -16,20 +16,20 @@ function memberList(members = []) {
   return members.map(m => `${m.name}(${m.id || m.role})`).join(', ') || 'unknown'
 }
 
-function formatRecent(messages = []) {
+function formatRecent(messages = [], tzOffset = null) {
   return messages
     .filter(m => m.text)
     .map(m => {
       const type = m.type || m.sender_type
       const who = type === 'user' || type === 'memo' ? 'User' : `Persona(${m.agentId || m.sender_id})`
-      const at = formatAbsTime(m.createdAt ?? m.created_at)
+      const at = formatAbsTime(m.createdAt ?? m.created_at, tzOffset)
       const stamp = at ? `[${at}] ` : ''
       return `${stamp}${who}: ${m.text}`
     })
     .join('\n') || '(none)'
 }
 
-export function buildPerceptionPrompt({ members, recentMessages, latestText, priorState, includeStructural = true }) {
+export function buildPerceptionPrompt({ members, recentMessages, latestText, priorState, includeStructural = false, tzOffset = null }) {
   // Structural signals (who it's aimed at / whose thread it continues / etc.)
   // only drive the group participation funnel. DMs don't gate, so they request
   // the emotion read only — lighter prompt, no wasted reasoning.
@@ -56,8 +56,9 @@ ${emotionFields}${includeStructural ? structuralFields : ''}
 Be honest and specific. Do not flatter. Most messages are mundane — say so plainly.
 ALWAYS write emotion_summary and hidden_insight in the SAME language the user is writing in (if they write Chinese, write them in Chinese). Never switch to another language.`
 
-  const user = `Recent turns:
-${formatRecent(recentMessages)}
+  const user = `Current time: ${formatAbsTime(Date.now(), tzOffset)} (timestamps below are absolute, in the user's local timezone)
+Recent turns:
+${formatRecent(recentMessages, tzOffset)}
 
 Prior emotional read (may be stale): ${priorState?.emotion_summary ? JSON.stringify({ emotion_summary: priorState.emotion_summary, intent: priorState.intent }) : 'none'}
 
@@ -90,8 +91,8 @@ export function parsePerception(text) {
   }
 }
 
-export async function perceiveTurn({ members = [], recentMessages = [], latestText = '', priorState = null, chat = cheapChat, includeStructural = true }) {
-  const { system, user } = buildPerceptionPrompt({ members, recentMessages, latestText, priorState, includeStructural })
+export async function perceiveTurn({ members = [], recentMessages = [], latestText = '', priorState = null, chat = cheapChat, includeStructural = false, tzOffset = null }) {
+  const { system, user } = buildPerceptionPrompt({ members, recentMessages, latestText, priorState, includeStructural, tzOffset })
   try {
     const text = await chat({ system, user, maxTokens: 500 })
     return parsePerception(text)

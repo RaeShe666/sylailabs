@@ -26,7 +26,7 @@ const MAX_UPLOAD_BYTES = 8 * 1024 * 1024
 // (typing / emoji / IME composition) AND the input box is empty AND no reply
 // is already streaming. Messages sent meanwhile just accumulate into the batch;
 // sending during a streaming reply queues rather than errors.
-const IDLE_MS = 4000          // input-silence window before replying
+const IDLE_MS = 2000          // input-silence window before replying
 const IDLE_POLL_MS = 400      // re-check cadence while waiting
 const IDLE_DEBUG = false      // show on-screen batching/idle timing panel (set false to hide)
 const getApiBase = () => {
@@ -547,6 +547,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
         : { id: planet.conversationId || planetConfig.conversationId, type: 'group' },
       user: userProfile,
       texts,
+      tzOffset: -new Date().getTimezoneOffset(),   // minutes east of UTC (UTC+8 → 480)
       ...(replyTo ? { replyTo } : {}),
       agents: agents.map(agent => ({
         id: agent.id,

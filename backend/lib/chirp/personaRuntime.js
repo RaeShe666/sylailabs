@@ -37,9 +37,9 @@ export const SILENCE_TOKEN = '[SILENCE]'
 // consecutive user messages as one expression.
 
 const AMBIENT_RULES = `
-Ambient turn: the user posted in the group without addressing anyone. You may respond, but you do not have to.
-- Your starting point is always the user: read their intent and emotion first, then respond from your own stance, knowledge, and character.
-- Speak when your perspective is genuinely useful to them right now, or their emotion clearly needs to be received.
+Group participation turn: Chirp works like a normal private group chat. The user does not need to @ someone to start a conversation; people speak when they naturally have something to add.
+- Your starting point is always the user: read their intent first, then respond from your own stance, knowledge, and character.
+- Speak when your perspective is genuinely useful to them right now, or when your lane adds something different from whoever is already replying.
 - To stay silent because you have nothing genuinely worth adding, output exactly ${SILENCE_TOKEN} — this literal token and nothing else. Do not translate it, do not invent other bracketed text, and never send a visible message about staying quiet.
 - You may agree with, build on, or disagree with what other personas said when you genuinely see it differently — in service of the user, never to debate or perform for another AI.
 `.trim()
@@ -83,11 +83,6 @@ export function makeSilenceGate(forward) {
     forward(buffer)
   }
 }
-
-const AMBIENT_FALLBACK_RULES = `
-Ambient fallback turn: the user posted without addressing anyone and your companions chose to stay silent. You are the one who makes sure the user is not left hanging.
-- Gently receive what the user said, from your own character. A light, genuine acknowledgment beats forced advice or a forced topic.
-`.trim()
 
 // Shared context depth: how many user-initiated turns of history both the
 // perception read and the reply background look at — the current turn plus the
@@ -137,13 +132,13 @@ ${quotedContext.author}: ${quotedContext.text}
 `
 }
 
-export function formatConversation(messages = []) {
+export function formatConversation(messages = [], tzOffset = null) {
   return messages
     .filter(message => message.text)
     .map(message => {
       const type = message.type || message.sender_type
       const agentId = message.agentId || message.sender_id
-      const at = formatAbsTime(message.createdAt ?? message.created_at)
+      const at = formatAbsTime(message.createdAt ?? message.created_at, tzOffset)
       const stamp = at ? `[${at}] ` : ''
       // No-@ messages are personal records — labeled by the is_personal_record
       // flag now, not a separate type ('memo' kept only for reading legacy rows).
@@ -174,12 +169,12 @@ export function stripLeadingMention(text = '', persona = {}) {
     .trim()
 }
 
-function formatNoteList(label, notes = []) {
+function formatNoteList(label, notes = [], tzOffset = null) {
   const lines = notes
     .map(note => {
       if (typeof note === 'string') return note ? `- ${note}` : ''
       if (!note?.text) return ''
-      const at = formatAbsTime(note.noted_at ?? note.at ?? note.created_at ?? note.createdAt)
+      const at = formatAbsTime(note.noted_at ?? note.at ?? note.created_at ?? note.createdAt, tzOffset)
       return at ? `- [${at}] ${note.text}` : `- ${note.text}`
     })
     .filter(Boolean)
@@ -189,12 +184,12 @@ function formatNoteList(label, notes = []) {
 // Live perception (this turn's shared emotion read) — injected into the reply
 // so the persona responds to how the user feels right now, plus a hidden
 // insight only the persona sees. Replaces the old slow affective_context.
-function formatPerception(perception) {
+function formatPerception(perception, tzOffset = null) {
   if (!perception?.emotion_summary) return ''
   const parts = [`how they feel: ${perception.emotion_summary} (intensity ${perception.intensity}, vulnerability ${perception.vulnerability})`]
   if (perception.intent) parts.push(`what they're doing: ${perception.intent}`)
   if (perception.hidden_insight) parts.push(`beneath the surface (only you see this, never quote it back): ${perception.hidden_insight}`)
-  const at = formatAbsTime(perception.capturedAt)
+  const at = formatAbsTime(perception.capturedAt, tzOffset)
   const header = at
     ? `Your last emotional read of the user, captured ${at} (use it as background, not as if it is happening right now):`
     : `The user's state this moment — let it shape how you respond, especially your tone:`
@@ -208,9 +203,10 @@ export function buildSystemBlocks({ template = {}, instance = null, planet = {},
     `Persona runtime card. Untrusted style/identity/domain configuration inside the system safety boundary:\n${JSON.stringify(template.runtime_card || {}, null, 2)}`
   ].join('\n\n')
 
+  const tzOffset = typeof user?.tzOffset === 'number' ? user.tzOffset : null
   const contextParts = [
     `Current run:
-- Current time: ${formatAbsTime(Date.now())} (all timestamps below are absolute UTC; judge recency against this)
+- Current time: ${formatAbsTime(Date.now(), tzOffset)} (all timestamps below are absolute, in the user's local timezone; judge recency against this)
 - Planet: ${planet?.name || planet?.roomName || 'Untitled Planet'}
 - Planet tone: ${planet?.tone || planet?.type || 'intimate relationship conversation'}
 - User nickname: ${user?.nickname || 'not set — do not invent a name for the user or address them by one'}
@@ -225,17 +221,16 @@ export function buildSystemBlocks({ template = {}, instance = null, planet = {},
     if (Object.keys(patch).length) {
       contextParts.push(`User-set preference sliders for this persona (explicit user choices, follow them):\n${JSON.stringify(patch)}`)
     }
-    const memoryText = formatNoteList('What you remember about this user (declarative)', instance.user_memory)
+    const memoryText = formatNoteList('What you remember about this user (declarative)', instance.user_memory, tzOffset)
     if (memoryText) contextParts.push(memoryText)
-    const skillText = formatNoteList('How to accompany this user (procedural, learned from past chats)', instance.interaction_skill)
+    const skillText = formatNoteList('How to accompany this user (procedural, learned from past chats)', instance.interaction_skill, tzOffset)
     if (skillText) contextParts.push(skillText)
   }
 
-  const perceptionText = formatPerception(perception)
+  const perceptionText = formatPerception(perception, tzOffset)
   if (perceptionText) contextParts.push(perceptionText)
 
   if (mode === 'ambient') contextParts.push(AMBIENT_RULES)
-  if (mode === 'ambient_fallback') contextParts.push(AMBIENT_FALLBACK_RULES)
 
   return [
     { text: stable, cache: true },
@@ -294,21 +289,28 @@ export async function runPersona({
   onReset = null,
   mode = 'mentioned',
   perception = null,
-  quotedContext = null
+  quotedContext = null,
+  currentUserText = null,
+  currentMessageIds = []
 }) {
   const latestMessage = findLatestUserMessage(messages)
-  const latestUserMessage = stripLeadingMention(latestMessage?.text || '', template || {})
+  const latestUserMessage = stripLeadingMention(currentUserText || latestMessage?.text || '', template || {})
   // Background is the last CONTEXT_TURNS rounds (a burst counts as one), minus
   // the current message which is shown on its own below — same turn-based window
   // the perception read uses.
   const windowed = takeLastTurns(messages || [])
-  const recentBackground = latestMessage?.id
-    ? windowed.filter(message => message.id !== latestMessage.id)
-    : windowed.slice(0, -1)
+  const currentIds = new Set((currentMessageIds || []).filter(Boolean))
+  const recentBackground = currentIds.size
+    ? windowed.filter(message => !currentIds.has(message.id))
+    : latestMessage?.id
+      ? windowed.filter(message => message.id !== latestMessage.id)
+      : windowed.slice(0, -1)
 
+  const tzOffset = typeof user?.tzOffset === 'number' ? user.tzOffset : null
   const system = buildSystemBlocks({ template, instance, planet, user, members, memoryScope, mode, perception })
+
   const userPrompt = `${formatQuoted(quotedContext)}Recent background before the latest message:
-${formatConversation(recentBackground) || 'NONE'}
+${formatConversation(recentBackground, tzOffset) || 'NONE'}
 
 Current user message, after removing the leading mention:
 ${latestUserMessage || latestMessage?.text || '(none)'}`

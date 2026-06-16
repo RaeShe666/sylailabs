@@ -41,28 +41,28 @@ test('mentioning multiple personas fans out to all of them in appearance order',
   ])
 })
 
-test('group message without mention stays a personal record but wakes ambient candidates', () => {
+test('group message without mention is ambient with no hardcoded targets', () => {
   const route = routeActivation({
     conversation: { type: 'group' },
     message: { text: '今天有点烦' },
     agents
   })
 
+  // No @, no quote → ambient. The first gate (turntargeting) + second gate
+  // decide who replies; the router no longer hardcodes a primary persona.
   assert.equal(route.triggerType, 'ambient')
   assert.equal(route.isPersonalRecord, true)
-  assert.equal(route.targets.length, 2)
-  assert.equal(route.targets[0].agentId, 'danzong')
-  assert.ok(['barry', 'duck'].includes(route.targets[1].agentId))
+  assert.deepEqual(route.targets, [])
 })
 
-test('ambient candidates are capped at two with 诞总 as fixed primary', () => {
+test('ambient routing names no persona (no fixed primary)', () => {
   const route = routeActivation({
     conversation: { type: 'group' },
     message: { text: '随便说说' },
     agents
   })
-  assert.ok(route.targets.length <= 2)
-  assert.equal(route.targets[0].agentId, 'danzong')
+  assert.equal(route.triggerType, 'ambient')
+  assert.deepEqual(route.targets, [])
 })
 
 test('@persona triggers only that persona', () => {

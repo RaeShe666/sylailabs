@@ -1,29 +1,5 @@
 const normalize = (value = '') => String(value).trim()
 
-const AMBIENT_MAX = 2
-const AMBIENT_PRIMARY_KEY = 'danzong'
-
-// Ambient reply (2026-06-11): a group message with no mention wakes up to two
-// system-picked candidates that decide for themselves whether to speak; the
-// Router guarantees at least one speaks via a fallback re-ask (no Bird in the
-// hot path, no user-facing toggle). Primary candidate is fixed (诞总); the
-// second rotates deterministically off the message text.
-export function pickAmbientTargets(agents = [], text = '') {
-  if (!agents.length) return []
-  const primary = agents.find(agent =>
-    agent.id === AMBIENT_PRIMARY_KEY || agent.personaKey === AMBIENT_PRIMARY_KEY
-  ) || agents[0]
-  const others = agents.filter(agent => agent.id !== primary.id)
-  const picked = [primary]
-
-  if (others.length) {
-    const seed = [...String(text || '')].reduce((sum, char) => sum + char.charCodeAt(0), 0)
-    picked.push(others[seed % others.length])
-  }
-
-  return picked.slice(0, AMBIENT_MAX)
-}
-
 // Mentions count anywhere in the message, not only at the start (Chinese text
 // has no spaces, so users naturally type "一行字@诞总"). If several personas
 // are mentioned, the earliest one wins; @all / @bird take precedence.
@@ -101,14 +77,14 @@ export function routeActivation({ conversation = {}, message = {}, agents = [], 
     return { triggerType, isPersonalRecord: false, targets }
   }
 
-  // No mention, no quoted target: ambient personal record. Ambient candidates
-  // may choose to respond (the participation funnel decides who, if anyone).
-  const ambientTargets = pickAmbientTargets(agents, message.text)
+  // No mention, no quoted target: ambient. The first gate (turntargeting) +
+  // second gate (per-persona self-judgment) decide who replies — no hardcoded
+  // primary persona. Targets stay empty; the planner works off `agents`.
   return {
-    triggerType: ambientTargets.length ? 'ambient' : 'group_personal_record',
+    triggerType: agents.length ? 'ambient' : 'group_personal_record',
     isPersonalRecord: true,
     ambient: true,
-    targets: ambientTargets.map(agent => ({ agentRole: 'persona', agentId: agent.id }))
+    targets: []
   }
 }
 

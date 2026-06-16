@@ -1,8 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parsePerception } from '../lib/chirp/perceptionLayer.js'
+import { buildPerceptionPrompt, parsePerception } from '../lib/chirp/perceptionLayer.js'
 import { takeLastTurns } from '../lib/chirp/personaRuntime.js'
-import { structuralObligation } from '../lib/chirp/participation.js'
+import { buildGatePrompt, structuralObligation } from '../lib/chirp/participation.js'
 
 test('parsePerception extracts fields, clamps, and normalizes refs', () => {
   const p = parsePerception(`prose... {
@@ -18,6 +18,15 @@ test('parsePerception extracts fields, clamps, and normalizes refs', () => {
   assert.equal(p.addressed_to, 'danzong')
   assert.equal(p.continues_thread_of, 'DANZONG')   // preserved (case kept)
   assert.equal(p.is_question, true)
+})
+
+test('perception prompt defaults to emotion-only fields', () => {
+  const { system } = buildPerceptionPrompt({ latestText: '今天有点累' })
+  assert.match(system, /emotion_summary/)
+  assert.match(system, /hidden_insight/)
+  assert.ok(!system.includes('addressed_to'))
+  assert.ok(!system.includes('continues_thread_of'))
+  assert.ok(!system.includes('emotional_bid'))
 })
 
 test('parsePerception normalizes null-ish refs and rejects garbage', () => {
@@ -65,4 +74,29 @@ test('structuralObligation fires on thread continuation and address, case-insens
   assert.equal(structuralObligation({ continues_thread_of: 'danzong', addressed_to: 'danzong' }, 'duck'), null)
   assert.equal(structuralObligation({ continues_thread_of: null, addressed_to: null }, 'danzong'), null)
   assert.equal(structuralObligation(null, 'danzong'), null)
+})
+
+test('second gate is pure self-judgment: no pile-on suppression, no injected prior emotion', () => {
+  const { system, user } = buildGatePrompt({
+    template: {
+      id: 'danzong',
+      runtime_card: { identity_summary: 'relaxed deconstructive friend' }
+    },
+    members: [{ id: 'danzong', name: 'Dan' }, { id: 'barry', name: 'Barry' }],
+    latestText: '你确定我现在是凌晨3点？',
+    recentMessages: [
+      { type: 'agent', agentId: 'danzong', text: '不过凌晨三点还在问这个。' }
+    ],
+    targeting: { must_reply: 'none', trigger: 'open', target_personas: [] }
+  })
+
+  assert.match(system, /decide ONLY for THIS persona/)
+  // self-judgment: overlap allowed, never silent just because others might reply
+  assert.match(system, /similar to another persona is completely fine/)
+  assert.match(system, /never stay silent just because someone else/)
+  // no pile-on / room-level suppression, and no previous-turn emotion injected
+  assert.doesNotMatch(system, /Default to staying quiet|calm room|Do not pile on/i)
+  assert.doesNotMatch(system, /Previous emotional read/i)
+  assert.match(user, /Recent context before latest:\nPersona\(danzong\): 不过凌晨三点/)
+  assert.match(user, /Current user turn:\n你确定我现在是凌晨3点？/)
 })

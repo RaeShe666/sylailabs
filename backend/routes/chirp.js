@@ -13,6 +13,8 @@ import { acquireVisibleRunLock, releaseVisibleRunLock } from '../lib/chirp/visib
 import { perceiveTurn } from '../lib/chirp/perceptionLayer.js'
 import { decideParticipation } from '../lib/chirp/participation.js'
 import { readEmotionState, readEmotionStateRow, writeEmotionState, appendEmotionLog } from '../lib/chirp/emotionStore.js'
+import { buildSpeakerPlans } from '../lib/chirp/turnPlanner.js'
+import { assessTurnTargeting } from '../lib/chirp/turnTargeting.js'
 
 const router = Router()
 
@@ -236,7 +238,7 @@ async function finishRun(runId, status, metadata = {}) {
     if (error) console.warn('Failed to update Chirp run:', error)
 }
 
-async function executeTargetRun({ ownerId, conversationId, planetId, conversationType, target, triggerType, planet, user, members, onText = null, onReset = null, mode = 'mentioned', perception = null, quotedContext = null }) {
+async function executeTargetRun({ ownerId, conversationId, planetId, conversationType, target, triggerType, planet, user, members, onText = null, onReset = null, mode = 'mentioned', perception = null, quotedContext = null, currentUserText = null, currentMessageIds = [] }) {
     let template = null
 
     if (target.agentRole !== 'bird') {
@@ -282,7 +284,7 @@ async function executeTargetRun({ ownerId, conversationId, planetId, conversatio
             return {
                 queries: result.queries,
                 result,
-                summary: formatRecallForPrompt(result)
+                summary: formatRecallForPrompt(result, user?.tzOffset)
             }
         }
         const reply = target.agentRole === 'bird'
@@ -295,7 +297,9 @@ async function executeTargetRun({ ownerId, conversationId, planetId, conversatio
                 recallTool,
                 onText,
                 onReset,
-                quotedContext
+                quotedContext,
+                currentUserText,
+                currentMessageIds
             })
             : await runPersona({
                 template,
@@ -310,7 +314,9 @@ async function executeTargetRun({ ownerId, conversationId, planetId, conversatio
                 onReset,
                 mode,
                 perception,
-                quotedContext
+                quotedContext,
+                currentUserText,
+                currentMessageIds
             })
 
         // Bookkeeping must not delay the reply.
@@ -327,7 +333,8 @@ async function executeTargetRun({ ownerId, conversationId, planetId, conversatio
         return {
             runId: run.id,
             agent: template || { id: 'bird', name: 'Bird', role: 'Observer' },
-            reply
+            reply,
+            mode
         }
     } catch (error) {
         finishRun(run.id, 'failed', { error: error.message }).catch(() => {})
@@ -336,7 +343,10 @@ async function executeTargetRun({ ownerId, conversationId, planetId, conversatio
 }
 
 async function prepareTurn({ ownerId, body }) {
-    const { planet, conversation, user, text, texts, agents = [], members = [], replyTo = null } = body || {}
+    const { planet, conversation, user, text, texts, agents = [], members = [], replyTo = null, tzOffset = null } = body || {}
+    // User's local timezone (minutes east of UTC) rides on the user object so every
+    // downstream prompt formats timestamps in the user's clock, not the server's UTC.
+    const userWithTz = { ...(user || {}), tzOffset: Number.isFinite(tzOffset) ? tzOffset : null }
     // A burst of quick messages arrives as `texts[]`; each becomes its own
     // bubble/row, but they are routed and answered as one expression.
     const batch = (Array.isArray(texts) ? texts : [text])
@@ -416,7 +426,7 @@ async function prepareTurn({ ownerId, body }) {
 
     return {
         planet,
-        user,
+        user: userWithTz,
         members,
         agents,
         planetId,
@@ -425,7 +435,10 @@ async function prepareTurn({ ownerId, body }) {
         activation,
         visibleRunLock,
         savedUserMessages,
-        quotedContext
+        currentUserText: batch.join('\n'),
+        currentMessageIds: savedUserMessages.map(message => message.id),
+        quotedContext,
+        tzOffset: userWithTz.tzOffset
     }
 }
 
@@ -494,12 +507,10 @@ async function readConversationRecent({ conversationId, fetchLimit = 50 }) {
     return takeLastTurns(chronological, CONTEXT_TURNS)
 }
 
-// The emotion/insight read is split off the reply critical path (persona-v2
-// §5.3): a turn's reply uses the PREVIOUS turn's stored emotion (readPriorEmotion
-// — a cheap DB read, no model wait); this turn's emotion+insight is computed and
-// stored in the BACKGROUND for the next turn + the trajectory. Group turns still
-// compute this turn's structural signals up front because the participation gate
-// needs them to decide who speaks.
+// The emotion/insight read is split off the reply critical path: a turn's reply
+// uses the PREVIOUS turn's stored emotion (readPriorEmotion — a cheap DB read,
+// no model wait); this turn's emotion+insight is computed and stored in the
+// BACKGROUND for the next turn + the trajectory.
 
 // Latest stored emotion slice — shapes THIS turn's reply tone (it is the
 // previous turn's read). Cheap DB read; never waits on a model. Carries its
@@ -510,15 +521,14 @@ async function readPriorEmotion({ ownerId, conversationId }) {
     return { ...row.state, capturedAt: row.updatedAt }
 }
 
-// Compute this turn's perception with the cheap model. Group turns include the
-// structural signals (addressed_to / continues_thread_of / is_question /
-// emotional_bid) for the gate; DM turns read emotion + insight only.
-async function computeTurnPerception({ ownerId, conversationId, members, latestText, includeStructural = true }) {
+// Compute this turn's emotion read with the cheap model. This is background
+// perception for the next turn / memory path, not participation routing.
+async function computeTurnPerception({ ownerId, conversationId, members, latestText, includeStructural = false, tzOffset = null }) {
     const [priorState, recentMessages] = await Promise.all([
         readEmotionState({ supabase: supabaseAdmin, userId: ownerId, conversationId }),
         readConversationRecent({ conversationId })
     ])
-    return perceiveTurn({ members, recentMessages, latestText, priorState, includeStructural })
+    return perceiveTurn({ members, recentMessages, latestText, priorState, includeStructural, tzOffset })
 }
 
 // Persist this turn's perception: the latest slice (fast prior read next turn) +
@@ -530,50 +540,30 @@ function persistTurnPerception({ ownerId, conversationId, perception }) {
     appendEmotionLog({ supabase: supabaseAdmin, userId: ownerId, conversationId, state: perception }).catch(() => {})
 }
 
-// Kick off this turn's perception compute+store in the background. For groups the
-// up-front structural read is reused (no second model call); for DMs it computes
-// emotion-only here. Never awaited on the reply path.
-function schedulePerceptionStore({ ownerId, conversationId, members, latestText, precomputed = null }) {
+// Kick off this turn's emotion compute+store in the background. Never awaited
+// on the reply path.
+function schedulePerceptionStore({ ownerId, conversationId, members, latestText, tzOffset = null }) {
     ;(async () => {
-        const perception = precomputed ?? await computeTurnPerception({
-            ownerId, conversationId, members, latestText, includeStructural: false
+        const perception = await computeTurnPerception({
+            ownerId, conversationId, members, latestText, includeStructural: false, tzOffset
         })
         persistTurnPerception({ ownerId, conversationId, perception })
     })().catch(() => {})
 }
 
-// Unified participation funnel (group turns). EVERY in-room persona is evaluated
-// every turn through participation.js:
-//   - A persona explicitly addressed this turn (@'d, @all, or quoted) has a hard
-//     obligation → replies, no gate call.
-//   - Everyone else runs their own obligation/motivation gate (shared perception
-//     + their own card) and chimes in only if genuinely moved.
-// So @诞总 still gets 诞总 for sure, but others may add a line if they truly have
-// something (the gate's ownerNote keeps them deferential). Bird is special: it
-// replies only when addressed (@bird / quoted), never via motivation.
-// `addressed` is false on pure ambient turns, where activation.targets are just
-// candidates, not real addressees.
-async function resolveGroupSpeakers({ agents = [], activation, perception, members, latestText }) {
-    const addressed = !['ambient', 'group_personal_record'].includes(activation?.triggerType)
-    const addressedIds = new Set(
-        addressed ? (activation?.targets || []).filter(t => t.agentRole === 'persona').map(t => t.agentId) : []
-    )
-    const birdAddressed = addressed && (activation?.targets || []).some(t => t.agentRole === 'bird')
-
-    const personaSpeakers = await Promise.all(agents.map(async (agent) => {
-        const template = await loadTemplateByKey({ supabase: supabaseAdmin, key: agent.id })
-        if (!template) return null
-        if (addressedIds.has(agent.id) || addressedIds.has(template.id)) {
-            return { agentRole: 'persona', agentId: template.id }   // hard obligation: addressed
-        }
-        const decision = await decideParticipation({ template, perception, members, latestText })
-        return decision.speak ? { agentRole: 'persona', agentId: template.id } : null
-    }))
-
-    const speakers = personaSpeakers.filter(Boolean)
-    if (birdAddressed) speakers.push({ agentRole: 'bird', agentId: 'bird' })
-    return speakers
+// Recent context for the gates. `recentMessages` (this conversation, minus the
+// just-sent turn) feeds the SECOND gate. `targeting` (the FIRST gate) is run only
+// for ambient turns (no @, no quote); quote turns send their non-quoted personas
+// straight to the second gate without a first gate.
+async function computeTurnContext({ conversationId, members, latestText, currentMessageIds = [], runTargeting = false }) {
+    const currentIds = new Set((currentMessageIds || []).filter(Boolean))
+    const recentMessages = (await readConversationRecent({ conversationId }))
+        .filter(message => !currentIds.has(message.id))
+    const targeting = runTargeting ? await assessTurnTargeting({ members, recentMessages, latestText }) : null
+    return { recentMessages, targeting }
 }
+
+const AMBIENT_TRIGGER_TYPES = new Set(['ambient', 'group_personal_record'])
 
 function sendSse(res, event, data) {
     res.write(`event: ${event}\n`)
@@ -588,49 +578,65 @@ router.post('/chirp/turn', authenticateUser, async (req, res) => {
         const isDM = turn.conversationType === 'persona_dm' || turn.conversationType === 'bird_dm'
         const latestText = turn.savedUserMessages.map(message => message.text).join('\n')
 
-        // Reply tone uses the PREVIOUS turn's stored emotion (cheap read); groups
-        // also compute THIS turn's structural signals up front for the gate. This
+        // Reply tone uses the PREVIOUS turn's stored emotion (cheap read). This
         // turn's emotion+insight is stored in the background for next turn + log.
         const priorEmotion = await readPriorEmotion({ ownerId: req.user.id, conversationId: turn.conversationId })
-        const gatePerception = isDM ? null : await computeTurnPerception({
-            ownerId: req.user.id,
-            conversationId: turn.conversationId,
-            members: turn.members,
-            latestText,
-            includeStructural: true
-        })
         schedulePerceptionStore({
             ownerId: req.user.id,
             conversationId: turn.conversationId,
             members: turn.members,
             latestText,
-            precomputed: gatePerception
+            tzOffset: turn.tzOffset
         })
 
-        // DM: the one persona/bird always replies. Group: everyone goes through
-        // the unified participation funnel (addressed = obligation, else gated).
-        const targets = isDM
-            ? turn.activation.targets
-            : await resolveGroupSpeakers({ agents: turn.agents, activation: turn.activation, perception: gatePerception, members: turn.members, latestText })
-
-        const runResults = await Promise.all(targets.map(target => executeTargetRun({
-            ownerId: req.user.id,
-            conversationId: turn.conversationId,
-            planetId: turn.planetId,
-            conversationType: turn.conversationType,
-            target,
-            triggerType: turn.activation.triggerType,
-            planet: turn.planet,
-            user: turn.user,
-            members: turn.members,
-            mode: 'mentioned',   // gated speakers reply directly; no in-reply silence
-            perception: priorEmotion,
-            quotedContext: turn.quotedContext
-        })))
+        const triggerType = turn.activation.triggerType
+        const isAmbient = !isDM && AMBIENT_TRIGGER_TYPES.has(triggerType)
+        const isQuote = triggerType === 'reply_persona'
+        const { recentMessages, targeting } = (isAmbient || isQuote)
+            ? await computeTurnContext({
+                conversationId: turn.conversationId,
+                members: turn.members,
+                latestText,
+                currentMessageIds: turn.currentMessageIds,
+                runTargeting: isAmbient
+            })
+            : { recentMessages: [], targeting: null }
+        const speakerPlans = buildSpeakerPlans({ isDM, activation: turn.activation, agents: turn.agents, targeting })
+        const runResults = await Promise.all(speakerPlans.map(async (plan) => {
+            if (plan.gate) {
+                const template = await loadTemplateByKey({ supabase: supabaseAdmin, key: plan.target.agentId })
+                if (!template) return null
+                const decision = await decideParticipation({
+                    template,
+                    members: turn.members,
+                    latestText,
+                    recentMessages,
+                    targeting,
+                    quotedContext: turn.quotedContext
+                })
+                if (!decision.speak) return null
+            }
+            return executeTargetRun({
+                ownerId: req.user.id,
+                conversationId: turn.conversationId,
+                planetId: turn.planetId,
+                conversationType: turn.conversationType,
+                target: plan.target,
+                triggerType: turn.activation.triggerType,
+                planet: turn.planet,
+                user: turn.user,
+                members: turn.members,
+                mode: plan.mode,
+                perception: priorEmotion,
+                quotedContext: turn.quotedContext,
+                currentUserText: turn.currentUserText,
+                currentMessageIds: turn.currentMessageIds
+            })
+        }))
         const agentMessages = []
 
         for (const result of runResults.filter(Boolean)) {
-            if (classifyReply(result.reply) === 'silence') continue
+            if (classifyReply(result.reply, result.mode) === 'silence') continue
             agentMessages.push(...await saveAgentReply({
                 planetId: turn.planetId,
                 conversationId: turn.conversationId,
@@ -687,28 +693,21 @@ router.post('/chirp/turn/stream', authenticateUser, async (req, res) => {
         const latestText = turn.savedUserMessages.map(message => message.text).join('\n')
 
         // Reply tone uses the PREVIOUS turn's stored emotion (cheap read, no model
-        // wait). Groups also compute THIS turn's structural signals up front for the
-        // gate; DM skips that. This turn's emotion+insight is stored in the
-        // background (reused for groups, computed for DM) for next turn + trajectory.
+        // wait). This turn's emotion+insight is stored in the background for next
+        // turn + trajectory.
         const priorEmotion = await readPriorEmotion({ ownerId: req.user.id, conversationId: turn.conversationId })
-        const gatePerception = isDM ? null : await computeTurnPerception({
-            ownerId: req.user.id,
-            conversationId: turn.conversationId,
-            members: turn.members,
-            latestText,
-            includeStructural: true
-        })
         schedulePerceptionStore({
             ownerId: req.user.id,
             conversationId: turn.conversationId,
             members: turn.members,
             latestText,
-            precomputed: gatePerception
+            tzOffset: turn.tzOffset
         })
         // Parallel fan-out — first done, first shown.
         const agentMessageIds = []
 
-        const streamTarget = async (target, index) => {
+        const streamTarget = async (plan, index) => {
+            const { target } = plan
             sendSse(res, 'agent_started', { target, index })
             try {
                 const forward = (delta) => sendSse(res, 'agent_delta', { target, index, delta })
@@ -722,14 +721,16 @@ router.post('/chirp/turn/stream', authenticateUser, async (req, res) => {
                     planet: turn.planet,
                     user: turn.user,
                     members: turn.members,
-                    mode: 'mentioned',   // gated speakers reply directly
+                    mode: plan.mode,
                     perception: priorEmotion,
                     quotedContext: turn.quotedContext,
+                    currentUserText: turn.currentUserText,
+                    currentMessageIds: turn.currentMessageIds,
                     onText: forward,
                     onReset: () => sendSse(res, 'agent_reset', { target, index })
                 })
                 sendSse(res, 'agent_finished', { target, index })
-                if (!result || classifyReply(result.reply) === 'silence') return null
+                if (!result || classifyReply(result.reply, result.mode) === 'silence') return null
                 const savedParts = await saveAgentReply({
                     planetId: turn.planetId,
                     conversationId: turn.conversationId,
@@ -747,32 +748,38 @@ router.post('/chirp/turn/stream', authenticateUser, async (req, res) => {
             }
         }
 
-        // Unified funnel (group): every persona is evaluated and starts replying
-        // the instant it passes — addressed (@/quote) = hard obligation (no gate
-        // call, replies immediately), everyone else runs its own gate in parallel
-        // and chimes in only if moved. Bird replies only if addressed. DM skips
-        // the funnel (the one persona/bird always replies). First decided, first
-        // speaking — no barrier on the slowest gate.
-        let runners
-        if (isDM) {
-            runners = turn.activation.targets.map((target, index) => () => streamTarget(target, index))
-        } else {
-            const addressed = !['ambient', 'group_personal_record'].includes(turn.activation.triggerType)
-            const addressedIds = new Set(
-                addressed ? turn.activation.targets.filter(t => t.agentRole === 'persona').map(t => t.agentId) : []
-            )
-            const birdAddressed = addressed && turn.activation.targets.some(t => t.agentRole === 'bird')
-            runners = turn.agents.map((agent, index) => async () => {
-                const template = await loadTemplateByKey({ supabase: supabaseAdmin, key: agent.id })
-                if (!template) return null
-                if (!addressedIds.has(agent.id) && !addressedIds.has(template.id)) {
-                    const decision = await decideParticipation({ template, perception: gatePerception, members: turn.members, latestText })
-                    if (!decision.speak) return null
-                }
-                return streamTarget({ agentRole: 'persona', agentId: template.id }, index)
+        // Unified funnel: hard targets start immediately; gated personas decide
+        // independently with compact context and speak only if moved. Bird replies
+        // only if addressed. DM skips the funnel.
+        const triggerType = turn.activation.triggerType
+        const isAmbient = !isDM && AMBIENT_TRIGGER_TYPES.has(triggerType)
+        const isQuote = triggerType === 'reply_persona'
+        const { recentMessages, targeting } = (isAmbient || isQuote)
+            ? await computeTurnContext({
+                conversationId: turn.conversationId,
+                members: turn.members,
+                latestText,
+                currentMessageIds: turn.currentMessageIds,
+                runTargeting: isAmbient
             })
-            if (birdAddressed) runners.push(() => streamTarget({ agentRole: 'bird', agentId: 'bird' }, turn.agents.length))
-        }
+            : { recentMessages: [], targeting: null }
+        const speakerPlans = buildSpeakerPlans({ isDM, activation: turn.activation, agents: turn.agents, targeting })
+        const runners = speakerPlans.map((plan, index) => async () => {
+            if (plan.gate) {
+                const template = await loadTemplateByKey({ supabase: supabaseAdmin, key: plan.target.agentId })
+                if (!template) return null
+                const decision = await decideParticipation({
+                    template,
+                    members: turn.members,
+                    latestText,
+                    recentMessages,
+                    targeting,
+                    quotedContext: turn.quotedContext
+                })
+                if (!decision.speak) return null
+            }
+            return streamTarget(plan, index)
+        })
 
         await Promise.all(runners.map(run => run()))
 
