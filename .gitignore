@@ -27,3 +27,9 @@ dist-ssr
 .env
 
 .claude/
+
+# Private design docs (kept local, not for GitHub)
+memory研究.md
+chirp-persona架构评估-2026-06.md
+chirp-persona-技术路线-v2.md
+chirp-行为地基-v2.md
