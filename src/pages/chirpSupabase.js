@@ -294,7 +294,7 @@ export async function updateChirpPlanet(planet, patch) {
 }
 
 // How many messages to load per page (initial open + each scroll-up fetch).
-export const HISTORY_PAGE_SIZE = 100
+export const HISTORY_PAGE_SIZE = 60
 
 // Fetch the most recent `limit` messages for a filter, returned in ascending
 // (display) order. `hasMore` is true when a full page came back — i.e. there may

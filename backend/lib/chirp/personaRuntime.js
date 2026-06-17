@@ -29,18 +29,16 @@ export const RECALL_TOOL = {
   }
 }
 
-export const SILENCE_TOKEN = '[SILENCE]'
-
 // Reply timing is decided on the client (2s of input silence + empty box;
 // persona-v2 §5.3), not by the model. The model always responds to whatever
 // batch it is given; the behavior base already tells it to read a run of
 // consecutive user messages as one expression.
 
 const AMBIENT_RULES = `
-Group participation turn: Chirp works like a normal private group chat. The user does not need to @ someone to start a conversation; people speak when they naturally have something to add.
+Group participation turn: Chirp works like a normal private group chat. The user does not need to @ someone to start a conversation.
+- The participation gate has already decided that you should speak in this turn; do not re-run turn-taking or explain why you are speaking.
 - Your starting point is always the user: read their intent first, then respond from your own stance, knowledge, and character.
-- Speak when your perspective is genuinely useful to them right now, or when your lane adds something different from whoever is already replying.
-- To stay silent because you have nothing genuinely worth adding, output exactly ${SILENCE_TOKEN} — this literal token and nothing else. Do not translate it, do not invent other bracketed text, and never send a visible message about staying quiet.
+- Just answer as yourself. Saying something similar to, or overlapping with, another persona is completely fine.
 - You may agree with, build on, or disagree with what other personas said when you genuinely see it differently — in service of the user, never to debate or perform for another AI.
 `.trim()
 
@@ -55,33 +53,13 @@ export function splitBubbles(text, max = 6) {
   return [...parts.slice(0, max - 1), parts.slice(max - 1).join(' ')]
 }
 
-// Reply classification: 'text' shows to the user; 'silence' = nothing to add.
-// On ambient turns a whole-bracket improvisation ("[无事可说]") is the model
-// fumbling the silence token, so treat it as silence too. On mentioned turns
-// the user addressed someone directly and expects a reply, so a stray bracket
-// line is still shown (rare; better than swallowing a real reply).
+// Reply classification: 'text' shows to the user; 'silence' only covers empty
+// model output. Turn-taking is decided by the gate before runtime, not by a
+// hidden generation-side silence protocol.
 export function classifyReply(reply, mode = 'mentioned') {
   const text = (reply?.text || '').trim()
-  if (!text || text === SILENCE_TOKEN) return 'silence'
-  if (mode === 'ambient' && /^[\[【][^\]】]{0,80}[\]】]$/.test(text)) return 'silence'
+  if (!text) return 'silence'
   return 'text'
-}
-
-// Streaming gate: hold deltas while the reply still looks like a bracketed
-// silence token/improvisation; ultra-short held replies simply arrive via the
-// final agent_message instead.
-export function makeSilenceGate(forward) {
-  let buffer = ''
-  let passing = false
-  return (delta) => {
-    if (passing) return forward(delta)
-    buffer += delta
-    const trimmed = buffer.trimStart()
-    if (!trimmed) return
-    if (trimmed[0] === '[' || trimmed[0] === '【') return
-    passing = true
-    forward(buffer)
-  }
 }
 
 // Shared context depth: how many user-initiated turns of history both the

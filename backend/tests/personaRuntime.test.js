@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { buildSystemBlocks, classifyReply, findLatestUserMessage, formatQuoted, makeSilenceGate, runPersona, splitBubbles } from '../lib/chirp/personaRuntime.js'
+import { buildSystemBlocks, classifyReply, findLatestUserMessage, formatQuoted, runPersona, splitBubbles } from '../lib/chirp/personaRuntime.js'
 
 const TEMPLATE = {
   id: 'danzong',
@@ -40,9 +40,10 @@ test('buildSystemBlocks puts bases + runtime card in the cacheable stable layer 
   assert.match(blocks[1].text, /directness/)
 })
 
-test('ambient mode adds the silence option and fallback modes are not supported', () => {
+test('ambient mode does not add a generation-side silence option', () => {
   const ambientBlocks = buildSystemBlocks({ template: TEMPLATE, mode: 'ambient' })
-  assert.match(ambientBlocks[1].text, /\[SILENCE\]/)
+  assert.doesNotMatch(ambientBlocks[1].text, /\[SILENCE\]/)
+  assert.doesNotMatch(ambientBlocks[1].text, /stay silent/i)
   assert.match(ambientBlocks[1].text, /starting point is always the user/)
 
   const fallbackBlocks = buildSystemBlocks({ template: TEMPLATE, mode: 'ambient_fallback' })
@@ -58,14 +59,13 @@ test('classifyReply separates text and silence (no completeness judgment)', () =
   assert.equal(classifyReply({ text: '在。说吧。' }, 'mentioned'), 'text')
   assert.equal(classifyReply({ text: '在。说吧。' }, 'ambient'), 'text')
 
-  // The silence token and empty replies never show.
-  assert.equal(classifyReply({ text: '[SILENCE]' }, 'ambient'), 'silence')
+  // Only empty replies are swallowed. Gate is the only normal turn-taking layer.
+  assert.equal(classifyReply({ text: '[SILENCE]' }, 'ambient'), 'text')
   assert.equal(classifyReply({ text: '  ' }, 'mentioned'), 'silence')
 
-  // Bracketed improvisations: silence on ambient (fumbled silence token); on
-  // mentioned the user expects a reply, so a stray bracket line still shows.
-  assert.equal(classifyReply({ text: '[无事可说你也不用跟我确认什么]' }, 'ambient'), 'silence')
-  assert.equal(classifyReply({ text: '【今天没什么想说的】' }, 'ambient'), 'silence')
+  // Bracketed text is visible text now; no ambient-only swallow path remains.
+  assert.equal(classifyReply({ text: '[无事可说你也不用跟我确认什么]' }, 'ambient'), 'text')
+  assert.equal(classifyReply({ text: '【今天没什么想说的】' }, 'ambient'), 'text')
   assert.equal(classifyReply({ text: '[在的]' }, 'mentioned'), 'text')
 })
 
@@ -75,21 +75,6 @@ test('no HOLD/timing rules injected into any turn (timing is client-side)', () =
     assert.ok(!blocks[1].text.includes('[HOLD]'), `${mode} should not mention HOLD`)
     assert.ok(!blocks[1].text.includes('Timing judgment'), `${mode} should not judge timing`)
   }
-})
-
-test('makeSilenceGate holds bracket-opening replies and streams normal ones', () => {
-  let streamed = ''
-  const gate = makeSilenceGate(delta => { streamed += delta })
-
-  gate('[无事')
-  gate('可说]')
-  assert.equal(streamed, '')
-
-  let streamed2 = ''
-  const gate2 = makeSilenceGate(delta => { streamed2 += delta })
-  gate2('上次')
-  gate2('也像一朵云')
-  assert.equal(streamed2, '上次也像一朵云')
 })
 
 test('splitBubbles splits on ||| and caps at six bubbles', () => {

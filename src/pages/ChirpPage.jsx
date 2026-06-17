@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, memo, startTransition, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import {
   BIRD,
@@ -15,7 +15,7 @@ import {
   writePlanetActivity
 } from './chirpShared'
 import { ensureChirpConversations, loadChirpMessages, loadChirpMessagesByConversation, loadOlderChirpMessages, loadCustomPersonas, loadPlanetMemberPersonas, saveChirpMessage, savePlanetMemberPersonas, updateChirpConversationTitle, updateChirpPlanet } from './chirpSupabase'
-import { getCachedMessages, setCachedMessages } from './chirpHistoryCache'
+import { getCachedMessages, getMessageCacheKey, setCachedMessages, updateCachedMessages } from './chirpHistoryCache'
 import './ChirpPage.css'
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
@@ -99,6 +99,8 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
     setIdleEvents(prev => [...prev.slice(-150), `${stamp}  ${msg}`])
   }
   const turnInFlightRef = useRef(false)
+  const activeTurnTokenRef = useRef(null)
+  const readyQueueRef = useRef([])
   // History paging + scroll anchoring (see chirp-history-loading-cache).
   const [hasMoreHistory, setHasMoreHistory] = useState(false)
   const [loadingOlder, setLoadingOlder] = useState(false)
@@ -111,10 +113,34 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
   // (or the planet id before that resolves — group messages carry planet_id too).
   // Cache/paging key. Group: the planet db id (stable, one group per planet, and
   // group messages carry planet_id). DM: its conversation id.
+  const conversationIdentity = isDM
+    ? `dm:${dmAgent?.id || dmConversationIdProp || dmConversationId || 'pending'}`
+    : `group:${planetConfig.id || planetConfig.dbId || 'pending'}`
+  const conversationIdentityRef = useRef(conversationIdentity)
+
   const conversationKey = isDM
     ? (dmConversationId || dmConversationIdProp || null)
-    : (planetConfig.dbId || null)
-  useEffect(() => { historyKeyRef.current = conversationKey }, [conversationKey])
+    : (planet.conversationId || planetConfig.conversationId || planetConfig.dbId || null)
+
+  useEffect(() => {
+    historyKeyRef.current = conversationKey
+  }, [conversationKey])
+
+  useEffect(() => {
+    conversationIdentityRef.current = conversationIdentity
+    if (collectTimerRef.current) {
+      window.clearTimeout(collectTimerRef.current)
+      collectTimerRef.current = null
+    }
+    collectRef.current = null
+    readyQueueRef.current = []
+    turnInFlightRef.current = false
+    activeTurnTokenRef.current = null
+    setTurnInFlight(false)
+    setTypingAgentId(null)
+    setTypingAgentIds([])
+    setStreamingReplies({})
+  }, [conversationIdentity])
 
   useEffect(() => {
     setPlanet(prev => ({
@@ -160,9 +186,11 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
     // Seed from this conversation's cache (instant, never another conversation's
     // content) instead of flashing the intro placeholder; the network refresh
     // below overwrites it. Arm a scroll-to-bottom for this entry.
-    const cacheKey = planetConfig.dbId || null
+    const cacheKey = planetConfig.conversationId || planetConfig.dbId || null
     const cached = cacheKey ? getCachedMessages(cacheKey) : null
-    setMessages(cached || createInitialMessages(planetConfig))
+    startTransition(() => {
+      setMessages(cached || createInitialMessages(planetConfig))
+    })
     setHasMoreHistory(false)
     atBottomRef.current = true
   }, [planetConfig.id, initialAgents, planetConfig])
@@ -179,13 +207,18 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
         // Group history pages by planet_id (group messages always carry it, and
         // older rows may predate the conversation_id column) — keep this column
         // identical to the older-page fetch so scroll-up loads everything.
-        const { messages: remoteMessages, hasMore } = await loadChirpMessages({ dbId: planetConfig.dbId })
+        const groupConversationId = planet.conversationId || planetConfig.conversationId || null
+        const { messages: remoteMessages, hasMore } = await loadChirpMessages({
+          dbId: planetConfig.dbId,
+          conversationId: groupConversationId
+        })
         if (cancelled) return
-        if (remoteMessages?.length) {
-          const cacheKey = planetConfig.dbId || null
-          if (cacheKey) setCachedMessages(cacheKey, remoteMessages)
-          setMessages(remoteMessages)
-        }
+        const cacheKey = groupConversationId || planetConfig.dbId || null
+        if (cacheKey) setCachedMessages(cacheKey, remoteMessages || [])
+        if (groupConversationId && planetConfig.dbId) setCachedMessages(planetConfig.dbId, remoteMessages || [])
+        startTransition(() => {
+          setMessages(remoteMessages || [])
+        })
         setHasMoreHistory(hasMore)
       } catch (error) {
         console.warn('Failed to load Chirp messages:', error)
@@ -193,7 +226,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
     }
     loadRemoteMessages()
     return () => { cancelled = true }
-  }, [planetConfig.dbId])
+  }, [planetConfig.dbId, planetConfig.conversationId, planet.conversationId])
 
   useEffect(() => {
     let cancelled = false
@@ -248,15 +281,17 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
     // — the `ensure` round trip then runs in the background only to sync.
     const knownId = dmConversationIdProp || null
     setDmConversationId(knownId)
-    setMessages((knownId && getCachedMessages(knownId)) || [])
+    startTransition(() => {
+      setMessages((knownId && getCachedMessages(knownId)) || [])
+    })
 
     const loadWindow = async (conversationId) => {
       const { messages: history, hasMore } = await loadChirpMessagesByConversation(conversationId)
       if (!alive) return
-      if (history.length) {
-        setCachedMessages(conversationId, history)
+      setCachedMessages(conversationId, history || [])
+      startTransition(() => {
         setMessages(history)
-      }
+      })
       setHasMoreHistory(hasMore)
     }
 
@@ -322,12 +357,53 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
     ))
   }, [mentionItems, mentionQuery])
 
-  const pushMessage = (message) => {
+  const mirrorCachedMessages = (primaryKey, nextMessages, relatedMessages = []) => {
+    const keys = new Set()
+    if (primaryKey) keys.add(primaryKey)
+    relatedMessages.forEach(message => {
+      const key = getMessageCacheKey(message, null)
+      if (key) keys.add(key)
+    })
+    keys.forEach(key => setCachedMessages(key, nextMessages))
+  }
+
+  const appendMessageToConversationCache = (primaryKey, message) => {
+    const keys = new Set()
+    if (primaryKey) keys.add(primaryKey)
+    const messageKey = getMessageCacheKey(message, null)
+    if (messageKey) keys.add(messageKey)
+    keys.forEach(key => {
+      updateCachedMessages(key, prev => (
+        prev.some(item => item.id && item.id === message.id) ? prev : [...prev, message]
+      ))
+    })
+  }
+
+  const updateMessagesForRun = (runKey, updater, relatedMessages = []) => {
+    if (historyKeyRef.current === runKey) {
+      setMessages(prev => {
+        const next = updater(prev)
+        mirrorCachedMessages(runKey, next, relatedMessages)
+        return next
+      })
+      return
+    }
+    const next = updateCachedMessages(runKey, updater)
+    mirrorCachedMessages(runKey, next, relatedMessages)
+  }
+
+  const pushMessage = (message, options = {}) => {
     const nextMessage = { id: `${Date.now()}-${Math.random()}`, createdAt: Date.now(), ...message }
+    const cacheKey = options.cacheKey || getMessageCacheKey(nextMessage, historyKeyRef.current)
+    const applyToUi = options.forceUi || historyKeyRef.current === cacheKey
+    if (!applyToUi) {
+      appendMessageToConversationCache(cacheKey, nextMessage)
+      return nextMessage
+    }
     atBottomRef.current = true   // sending/receiving pins the view to the latest
     setMessages(prev => {
       const next = [...prev, nextMessage]
-      if (historyKeyRef.current) setCachedMessages(historyKeyRef.current, next)
+      mirrorCachedMessages(cacheKey, next, [nextMessage])
       return next
     })
     return nextMessage
@@ -363,8 +439,10 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
     const key = historyKeyRef.current
     try {
       const { messages: older, hasMore } = await loadOlderChirpMessages({
-        conversationId: isDM ? dmConversationId : null,   // group → planet_id, DM → conversation_id
-        planetId: isDM ? null : planetConfig.dbId,
+        conversationId: isDM
+          ? dmConversationId
+          : (planet.conversationId || planetConfig.conversationId || null),
+        planetId: isDM || planet.conversationId || planetConfig.conversationId ? null : planetConfig.dbId,
         beforeCreatedAt: new Date(oldest.createdAt).toISOString()
       })
       if (older.length) {
@@ -701,6 +779,11 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
   const runCollectedTurn = async (collected) => {
     const mention = collected.mention
     const localMessages = collected.localMessages
+    const runKey = collected.conversationKey || historyKeyRef.current
+    const runIdentity = collected.conversationIdentity || conversationIdentityRef.current
+    const isCurrentRun = () => conversationIdentityRef.current === runIdentity
+    const controlsCurrentQueue = isCurrentRun()
+    const turnToken = Symbol('chirp-turn')
 
     if (mention === 'all' || mention === 'bird') {
       setActiveAgentId(null)
@@ -708,13 +791,16 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
       setActiveAgentId(mention)
     }
 
-    setTurnInFlight(true)
-    turnInFlightRef.current = true
-    setTypingAgentIds([])
+    if (controlsCurrentQueue) {
+      setTurnInFlight(true)
+      setTypingAgentIds([])
+      activeTurnTokenRef.current = turnToken
+      turnInFlightRef.current = true
+    }
     const turn = await requestChirpTurnStream(collected.texts, collected.baseMessages, (event, data) => {
       if (event === 'user_messages' && Array.isArray(data)) {
         // Reconcile each local bubble with its persisted row, in order.
-        setMessages(prev => {
+        updateMessagesForRun(runKey, prev => {
           const next = [...prev]
           data.forEach((saved, index) => {
             const local = localMessages[index]
@@ -723,7 +809,14 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
             if (at >= 0) next[at] = { ...next[at], id: saved.id, text: saved.text || next[at].text, isPersonalRecord: saved.isPersonalRecord }
           })
           return next
-        })
+        }, data)
+        return
+      }
+
+      if (!isCurrentRun()) {
+        if (event === 'agent_message' && data?.message) {
+          appendMessageToConversationCache(runKey, data.message)
+        }
         return
       }
 
@@ -777,15 +870,20 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
           delete next[data.index]
           return next
         })
-        if (message.text) pushMessage(message)
+        if (message.text) pushMessage(message, { cacheKey: runKey, forceUi: true })
       }
     }, collected.replyTo)
 
-    setTurnInFlight(false)
-    turnInFlightRef.current = false
-    setTypingAgentId(null)
-    setTypingAgentIds([])
-    setStreamingReplies({})
+    if (controlsCurrentQueue && activeTurnTokenRef.current === turnToken) {
+      setTurnInFlight(false)
+      turnInFlightRef.current = false
+      activeTurnTokenRef.current = null
+    }
+    if (isCurrentRun()) {
+      setTypingAgentId(null)
+      setTypingAgentIds([])
+      setStreamingReplies({})
+    }
 
     if (!turn?.success) {
       const authError = turn?.error === 'auth_required' || String(turn?.error || '').includes('401')
@@ -796,7 +894,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
       // Non-stream fallback: reconcile local bubbles with persisted rows in order.
       const returnedUserMessages = turn.messages.filter(message => message.type === 'user' || message.type === 'memo')
       if (returnedUserMessages.length) {
-        setMessages(prev => {
+        updateMessagesForRun(runKey, prev => {
           const next = [...prev]
           returnedUserMessages.forEach((saved, index) => {
             const local = localMessages[index]
@@ -805,11 +903,11 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
             if (at >= 0) next[at] = { ...next[at], id: saved.id, text: saved.text || next[at].text, isPersonalRecord: saved.isPersonalRecord }
           })
           return next
-        })
+        }, returnedUserMessages)
       }
 
       for (const message of turn.messages.filter(item => item.type === 'agent')) {
-        if (message.text) pushMessage(message)
+        if (message.text) pushMessage(message, { cacheKey: runKey, forceUi: isCurrentRun() })
       }
     }
 
@@ -820,10 +918,6 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
     // After a reply finishes, run anything that queued up while it streamed.
     drainReadyQueue()
   }
-
-  // Sealed batches waiting to run, in order. Drained one at a time so two
-  // visible reply runs never overlap (mirrors the backend single-run lock).
-  const readyQueueRef = useRef([])
 
   const drainReadyQueue = () => {
     if (turnInFlightRef.current) return
@@ -920,7 +1014,9 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
         mention,
         replyTo,
         localMessages: [localUserMessage],
-        baseMessages: messages
+        baseMessages: messages,
+        conversationKey: historyKeyRef.current,
+        conversationIdentity: conversationIdentityRef.current
       }
     }
     if (quoting) setQuoting(null)
@@ -1170,7 +1266,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
   )
 }
 
-function MessageBubble({ message, agents, bird, language, onQuote, onOpenPersona, isDM }) {
+const MessageBubble = memo(function MessageBubble({ message, agents, bird, language, onQuote, onOpenPersona, isDM }) {
   if (message.type === 'system') return null
   // A reply icon appears on hover (no right-click); clicking it quotes this
   // bubble into the composer.
@@ -1231,7 +1327,14 @@ function MessageBubble({ message, agents, bird, language, onQuote, onOpenPersona
       </div>
     </div>
   )
-}
+}, (prev, next) => (
+  prev.message === next.message
+  && prev.agents === next.agents
+  && prev.bird === next.bird
+  && prev.language === next.language
+  && prev.isDM === next.isDM
+  && prev.onOpenPersona === next.onOpenPersona
+))
 
 function ReplyIcon() {
   return (

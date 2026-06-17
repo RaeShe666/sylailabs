@@ -40,6 +40,24 @@ export function setCachedMessages(key, messages) {
   }
 }
 
+export function updateCachedMessages(key, updater) {
+  if (!key || typeof updater !== 'function') return []
+  const current = getCachedMessages(key) || []
+  const next = updater(current)
+  const normalized = Array.isArray(next) ? next : current
+  setCachedMessages(key, normalized)
+  return normalized
+}
+
+export function getMessageCacheKey(message = {}, fallbackKey = null) {
+  return message.conversationId
+    || message.conversation_id
+    || message.planetId
+    || message.planet_id
+    || fallbackKey
+    || null
+}
+
 export function clearHistoryCache() {
   CACHE.clear()
 }
