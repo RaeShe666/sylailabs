@@ -50,30 +50,25 @@ export function routeActivation({ conversation = {}, message = {}, agents = [], 
   }
 
   // @-mentions and a quoted bubble COMPOSE into the target set. A quoted
-  // persona/bird must reply (it's an obligation) and is added alongside any @ —
+  // persona must reply (it's an obligation) and is added alongside any @ —
   // it never overrides it, so there is no quote-vs-@ conflict. Quoting the
   // user's own bubble forces no target: routing then follows the text (@ or
   // ambient) and the quote is carried only as prompt context.
   const quoted = resolveQuotedTarget(replyTo)
   // Bird is DM-only now — it never participates in a group, so @bird / quoting
   // bird inside a group does nothing (the message falls through to ambient).
-  const wantBird = false
   const personaIds = []
   if (mention.type === 'all') agents.forEach(agent => personaIds.push(agent.id))
   else if (mention.type === 'persona') mention.agentIds.forEach(id => personaIds.push(id))
   if (quoted?.type === 'persona' && !personaIds.includes(quoted.agentId)) personaIds.push(quoted.agentId)
 
-  const targets = [
-    ...(wantBird ? [{ agentRole: 'bird', agentId: 'bird' }] : []),
-    ...personaIds.map(agentId => ({ agentRole: 'persona', agentId }))
-  ]
+  const targets = personaIds.map(agentId => ({ agentRole: 'persona', agentId }))
 
   if (targets.length) {
     let triggerType
     if (mention.type === 'all') triggerType = 'mention_all'
     else if (personaIds.length > 1) triggerType = 'mention_personas'
-    else if (personaIds.length === 1) triggerType = mention.type === 'persona' ? 'mention_persona' : 'reply_persona'
-    else triggerType = mention.type === 'bird' ? 'mention_bird' : 'reply_bird'
+    else triggerType = mention.type === 'persona' ? 'mention_persona' : 'reply_persona'
     return { triggerType, isPersonalRecord: false, targets }
   }
 
@@ -92,10 +87,9 @@ export function routeActivation({ conversation = {}, message = {}, agents = [], 
 // agent. Quoting the user's own message returns null (routing follows the text).
 function resolveQuotedTarget(replyTo) {
   if (!replyTo) return null
-  if (replyTo.agentRole === 'bird' || replyTo.agentId === 'bird') return { type: 'bird' }
+  if (replyTo.agentRole === 'bird' || replyTo.agentId === 'bird') return null
   if (replyTo.agentRole === 'persona' || (replyTo.agentId && replyTo.agentId !== 'user')) {
     return { type: 'persona', agentId: replyTo.agentId }
   }
   return null
 }
-

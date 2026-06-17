@@ -16,9 +16,10 @@ import {
 } from './chirpShared'
 import { ensureChirpConversations, loadChirpMessages, loadChirpMessagesByConversation, loadOlderChirpMessages, loadCustomPersonas, loadPlanetMemberPersonas, saveChirpMessage, savePlanetMemberPersonas, updateChirpConversationTitle, updateChirpPlanet } from './chirpSupabase'
 import { getCachedMessages, getMessageCacheKey, setCachedMessages, updateCachedMessages } from './chirpHistoryCache'
+import { buildChirpTurnPayload } from './chirpTurnPayload'
+import { takeNextReadyTurn } from './chirpTurnQueue'
 import './ChirpPage.css'
 
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 const MAX_UPLOAD_BYTES = 8 * 1024 * 1024
 // Reply timing (persona-v2 §5.3): people split one thought across several quick
 // messages, so we don't reply on send — we reply once the user goes quiet.
@@ -37,9 +38,9 @@ const getApiBase = () => {
 
 const createInitialMessages = (planet) => {
   return [
-    { id: 'm1', type: 'user', isPersonalRecord: true, text: '他今天只回了一个“嗯嗯”，我有点想装作没事，但其实一直在想。', createdAt: Date.now() - 1000 * 60 * 4 },
-    { id: 'm2', type: 'user', text: '@诞总 这是不是有点冷了？', read: true, createdAt: Date.now() - 1000 * 60 * 3 },
-    { id: 'm3', type: 'agent', agentId: 'danzong', text: '一个“嗯嗯”还不能判死刑，最多算关系天气预报里飘过一朵云。你先别替他把整部剧写完，看他后面有没有补动作。', createdAt: Date.now() - 1000 * 60 * 2 }
+    { id: 'm1', type: 'user', isPersonalRecord: true, text: 'He only replied "mm" today. I want to act like it is fine, but I keep thinking about it.', createdAt: Date.now() - 1000 * 60 * 4 },
+    { id: 'm2', type: 'user', text: '@Danzong is this getting cold?', read: true, createdAt: Date.now() - 1000 * 60 * 3 },
+    { id: 'm3', type: 'agent', agentId: 'danzong', text: 'One "mm" is not enough evidence for a verdict. Treat it like one cloud in the weather report and watch what he does next.', createdAt: Date.now() - 1000 * 60 * 2 }
   ]
 }
 
@@ -69,7 +70,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
   const [messages, setMessages] = useState(() => (dmAgent ? [] : createInitialMessages(planetConfig)))
   const [dmConversationId, setDmConversationId] = useState(null)
   const [input, setInput] = useState('')
-  const [quoting, setQuoting] = useState(null)   // the bubble being quoted (right-click), or null
+  const [quoting, setQuoting] = useState(null)   // the bubble being quoted, or null
   const [activeAgentId, setActiveAgentId] = useState(initialAgents[0]?.id || null)
   const [mentionOpen, setMentionOpen] = useState(false)
   const [mentionQuery, setMentionQuery] = useState('')
@@ -77,7 +78,6 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsDraft, setSettingsDraft] = useState({ name: planetConfig.groupName || planetConfig.roomName })
   const [nameEditing, setNameEditing] = useState(false)
-  const [typingAgentId, setTypingAgentId] = useState(null)
   const [typingAgentIds, setTypingAgentIds] = useState([])
   const [streamingReplies, setStreamingReplies] = useState({})
   const [turnInFlight, setTurnInFlight] = useState(false)
@@ -101,6 +101,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
   const turnInFlightRef = useRef(false)
   const activeTurnTokenRef = useRef(null)
   const readyQueueRef = useRef([])
+  const inFlightConversationsRef = useRef(new Set())
   // History paging + scroll anchoring (see chirp-history-loading-cache).
   const [hasMoreHistory, setHasMoreHistory] = useState(false)
   const [loadingOlder, setLoadingOlder] = useState(false)
@@ -127,19 +128,22 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
   }, [conversationKey])
 
   useEffect(() => {
-    conversationIdentityRef.current = conversationIdentity
     if (collectTimerRef.current) {
       window.clearTimeout(collectTimerRef.current)
       collectTimerRef.current = null
     }
-    collectRef.current = null
-    readyQueueRef.current = []
-    turnInFlightRef.current = false
-    activeTurnTokenRef.current = null
-    setTurnInFlight(false)
-    setTypingAgentId(null)
+    if (collectRef.current) {
+      readyQueueRef.current.push(collectRef.current)
+      collectRef.current = null
+    }
+    conversationIdentityRef.current = conversationIdentity
+    const currentConversationInFlight = inFlightConversationsRef.current.has(conversationIdentity)
+    turnInFlightRef.current = currentConversationInFlight
+    if (!currentConversationInFlight) activeTurnTokenRef.current = null
+    setTurnInFlight(currentConversationInFlight)
     setTypingAgentIds([])
     setStreamingReplies({})
+    drainReadyQueue()
   }, [conversationIdentity])
 
   useEffect(() => {
@@ -491,7 +495,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
   // Mentions count anywhere in the message (mirrors backend parseMention).
   const resolveMention = (text) => {
     if (/@all\b/i.test(text)) return 'all'
-    if (/@(bird\b|小鸟)/i.test(text)) return 'bird'
+    if (/@bird\b/i.test(text)) return 'bird'
     const lower = text.toLowerCase()
     const hits = agents
       .map(agent => {
@@ -582,7 +586,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
     showToast(isChinese ? '暂不支持图片上传。' : 'Image upload is not available yet.')
   }
 
-  const requestChirpTurn = async (texts, currentMessages, replyTo = null) => {
+  const requestChirpTurn = async (payload) => {
     try {
       const apiBase = getApiBase()
       const token = await getAccessToken()
@@ -595,7 +599,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
       const response = await fetch(`${apiBase}/api/chirp/turn`, {
         method: 'POST',
         headers,
-        body: JSON.stringify(buildTurnPayload(texts, currentMessages, replyTo))
+        body: JSON.stringify(payload)
       })
 
       if (!response.ok) {
@@ -610,48 +614,27 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
     }
   }
 
-  const buildTurnPayload = (texts, currentMessages, replyTo = null) => {
+  const buildTurnPayloadSnapshot = (texts, currentMessages, replyTo = null) => {
     const recent = getPlanetRecent(planet)
-    return {
-      planet: {
-        ...planet,
-        recentUserMessage: recent.rawText || recent.text,
-        recentUserMessageAt: recent.timestamp
-      },
-      conversation: isDM
-        ? (isBirdDM
-            ? { id: dmConversationId || null, type: 'bird_dm', title: dmAgent.name }
-            : { id: dmConversationId || null, type: 'persona_dm', agentId: dmAgent.id, personaId: dmAgent.id, title: dmAgent.name })
-        : { id: planet.conversationId || planetConfig.conversationId, type: 'group' },
-      user: userProfile,
+    return buildChirpTurnPayload({
       texts,
-      tzOffset: -new Date().getTimezoneOffset(),   // minutes east of UTC (UTC+8 → 480)
-      ...(replyTo ? { replyTo } : {}),
-      agents: agents.map(agent => ({
-        id: agent.id,
-        name: agent.name,
-        role: agent.role,
-        systemPrompt: agent.systemPrompt,
-        skills: agent.skills,
-        identity: agent.identity,
-        relationship: agent.relationship,
-        voice_style: agent.voice_style,
-        boundaries: agent.boundaries,
-        reply_policy: agent.reply_policy,
-        memory_policy: agent.memory_policy,
-        examples: agent.examples,
-        lane_contract: agent.lane_contract
-      })),
-      members: visibleMembers.map(member => ({ id: member.id, name: member.name, role: member.role })),
-      messages: currentMessages.slice(-12).map(message => ({
-        type: message.type,
-        text: message.text,
-        agentId: message.agentId
-      }))
-    }
+      currentMessages,
+      replyTo,
+      planet,
+      planetConfig,
+      recent,
+      isDM,
+      isBirdDM,
+      dmAgent,
+      dmConversationId,
+      userProfile,
+      agents,
+      visibleMembers,
+      tzOffset: -new Date().getTimezoneOffset()
+    })
   }
 
-  const requestChirpTurnStream = async (texts, currentMessages, onEvent, replyTo = null) => {
+  const requestChirpTurnStream = async (payload, onEvent) => {
     try {
       const apiBase = getApiBase()
       const token = await getAccessToken()
@@ -664,11 +647,11 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
           Accept: 'text/event-stream',
           Authorization: `Bearer ${token}`
         },
-        body: JSON.stringify(buildTurnPayload(texts, currentMessages, replyTo))
+        body: JSON.stringify(payload)
       })
 
       if (!response.ok || !response.body) {
-        return { ...(await requestChirpTurn(texts, currentMessages, replyTo)), fallback: true }
+        return { ...(await requestChirpTurn(payload)), fallback: true }
       }
 
       const reader = response.body.getReader()
@@ -701,32 +684,8 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
       return streamError ? { success: false, error: streamError } : { success: true }
     } catch (error) {
       console.warn('Chirp turn stream failed:', error)
-      return { ...(await requestChirpTurn(texts, currentMessages, replyTo)), fallback: true }
+      return { ...(await requestChirpTurn(payload)), fallback: true }
     }
-  }
-
-  // All callers pass canned text (bird admin replies); model replies go
-  // through /chirp/turn now.
-  const replyAsAgent = async (agent, overrideText) => {
-    let typingVisible = false
-    const typingTimer = overrideText ? null : window.setTimeout(() => {
-      typingVisible = true
-      setTypingAgentId(agent.id)
-    }, 2000)
-
-    if (typingTimer) window.clearTimeout(typingTimer)
-
-    const replyText = overrideText
-    if (!replyText) {
-      setTypingAgentId(null)
-      showToast(isChinese ? 'AI 连接失败，请重试。' : 'AI connection failed. Please try again.')
-      return
-    }
-
-    if (typingVisible) await sleep(380)
-    setTypingAgentId(null)
-    const savedAgentMessage = pushMessage({ type: 'agent', agentId: agent.id, text: replyText })
-    persistMessage(savedAgentMessage)
   }
 
   const addPersonaFromCommunity = () => {
@@ -742,40 +701,6 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
     return candidate
   }
 
-  const handleBirdAdmin = async (text) => {
-    const adminIntent = /(推荐|找.*persona|人格|拉|加入|添加|踢|删除|移除|改名|名称|背景|昵称|头像|member|add|remove|rename)/i.test(text)
-    if (!adminIntent) {
-      await replyAsAgent(bird, isChinese ? '我只处理这里的管理任务。你可以让我查找、添加、移除 persona，或修改房间设置。' : 'I only handle admin tasks here. Ask me to find, add, remove, rename, or adjust the room.')
-      return
-    }
-    if (/(推荐|找.*persona|人格)/i.test(text)) {
-      const candidate = PERSONA_POOL.find(persona => !agents.some(agent => agent.id === persona.id))
-      await replyAsAgent(bird, candidate ? (isChinese ? `这个房间已有核心声音，也可以加入 ${candidate.name}：${candidate.role}。` : `This room has its core voices, but it could use ${candidate.name}: ${candidate.role}.`) : (isChinese ? '所有 persona 都已在这个房间中。' : 'All personas are already in this room.'))
-      return
-    }
-    if (/(加入|添加|add)/i.test(text)) {
-      const added = addPersonaFromCommunity()
-      await replyAsAgent(bird, added ? (isChinese ? `好了，我加入了 ${added.name}。` : `Done. I added ${added.name}.`) : (isChinese ? '目前没有可添加的 persona。' : 'No persona is available right now.'))
-      return
-    }
-    if (/(踢|删除|移除|remove)/i.test(text)) {
-      const removed = agents[agents.length - 1]
-      if (!removed) return
-      setAgents(prev => prev.slice(0, -1))
-      if (activeAgentId === removed.id) setActiveAgentId(null)
-      await replyAsAgent(bird, isChinese ? `好了，我移除了 ${removed.name}。` : `Done. I removed ${removed.name}.`)
-      return
-    }
-    if (/(改名|名称|rename)/i.test(text)) {
-      setPlanet(prev => ({ ...prev, name: 'Soft Reset' }))
-      await replyAsAgent(bird, isChinese ? '好了，我重命名了这个星球。' : 'Done. I renamed this Planet.')
-      return
-    }
-    if (/背景/i.test(text)) {
-      setPlanet(prev => ({ ...prev, background: '#FFF8E7' }))
-      await replyAsAgent(bird, isChinese ? '好了，我把背景调得更温暖了一些。' : 'Done. I warmed up the background.')
-    }
-  }
   const runCollectedTurn = async (collected) => {
     const mention = collected.mention
     const localMessages = collected.localMessages
@@ -784,6 +709,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
     const isCurrentRun = () => conversationIdentityRef.current === runIdentity
     const controlsCurrentQueue = isCurrentRun()
     const turnToken = Symbol('chirp-turn')
+    inFlightConversationsRef.current.add(runIdentity)
 
     if (mention === 'all' || mention === 'bird') {
       setActiveAgentId(null)
@@ -797,7 +723,8 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
       activeTurnTokenRef.current = turnToken
       turnInFlightRef.current = true
     }
-    const turn = await requestChirpTurnStream(collected.texts, collected.baseMessages, (event, data) => {
+    try {
+      const turn = await requestChirpTurnStream(collected.payload, (event, data) => {
       if (event === 'user_messages' && Array.isArray(data)) {
         // Reconcile each local bubble with its persisted row, in order.
         updateMessagesForRun(runKey, prev => {
@@ -874,54 +801,59 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
       }
     }, collected.replyTo)
 
-    if (controlsCurrentQueue && activeTurnTokenRef.current === turnToken) {
-      setTurnInFlight(false)
-      turnInFlightRef.current = false
-      activeTurnTokenRef.current = null
-    }
-    if (isCurrentRun()) {
-      setTypingAgentId(null)
-      setTypingAgentIds([])
-      setStreamingReplies({})
-    }
+      if (isCurrentRun()) {
+        setTypingAgentIds([])
+        setStreamingReplies({})
+      }
 
-    if (!turn?.success) {
-      const authError = turn?.error === 'auth_required' || String(turn?.error || '').includes('401')
-      showToast(authError
+      if (!turn?.success) {
+        const authError = turn?.error === 'auth_required' || String(turn?.error || '').includes('401')
+        if (isCurrentRun()) {
+          showToast(authError
         ? (isChinese ? '请先登录后再聊天。' : 'Please sign in before chatting.')
         : (isChinese ? `AI 连接失败：${turn?.error || 'unknown'}` : `AI connection failed: ${turn?.error || 'unknown'}`))
-    } else if (turn.messages?.length) {
-      // Non-stream fallback: reconcile local bubbles with persisted rows in order.
-      const returnedUserMessages = turn.messages.filter(message => message.type === 'user' || message.type === 'memo')
-      if (returnedUserMessages.length) {
-        updateMessagesForRun(runKey, prev => {
-          const next = [...prev]
-          returnedUserMessages.forEach((saved, index) => {
-            const local = localMessages[index]
-            if (!local) return
-            const at = next.findIndex(message => message.id === local.id)
-            if (at >= 0) next[at] = { ...next[at], id: saved.id, text: saved.text || next[at].text, isPersonalRecord: saved.isPersonalRecord }
-          })
-          return next
-        }, returnedUserMessages)
-      }
+        }
+      } else if (turn.messages?.length) {
+        // Non-stream fallback: reconcile local bubbles with persisted rows in order.
+        const returnedUserMessages = turn.messages.filter(message => message.type === 'user' || message.type === 'memo')
+        if (returnedUserMessages.length) {
+          updateMessagesForRun(runKey, prev => {
+            const next = [...prev]
+            returnedUserMessages.forEach((saved, index) => {
+              const local = localMessages[index]
+              if (!local) return
+              const at = next.findIndex(message => message.id === local.id)
+              if (at >= 0) next[at] = { ...next[at], id: saved.id, text: saved.text || next[at].text, isPersonalRecord: saved.isPersonalRecord }
+            })
+            return next
+          }, returnedUserMessages)
+        }
 
-      for (const message of turn.messages.filter(item => item.type === 'agent')) {
-        if (message.text) pushMessage(message, { cacheKey: runKey, forceUi: isCurrentRun() })
+        for (const message of turn.messages.filter(item => item.type === 'agent')) {
+          if (message.text) pushMessage(message, { cacheKey: runKey, forceUi: isCurrentRun() })
+        }
       }
-    }
 
     // A DM's conversation is created on its first message — tell the host so the
-    // left list can show it without a manual refresh.
-    if (isDM) onDmStarted?.()
-
-    // After a reply finishes, run anything that queued up while it streamed.
-    drainReadyQueue()
+      // left list can show it without a manual refresh.
+      if (isDM) onDmStarted?.()
+    } finally {
+      // After a reply finishes or fails locally, run anything that queued up.
+      inFlightConversationsRef.current.delete(runIdentity)
+      if (isCurrentRun()) {
+        const stillCurrentConversationInFlight = inFlightConversationsRef.current.has(runIdentity)
+        setTurnInFlight(stillCurrentConversationInFlight)
+        turnInFlightRef.current = stillCurrentConversationInFlight
+        if (controlsCurrentQueue && activeTurnTokenRef.current === turnToken) activeTurnTokenRef.current = null
+        setTypingAgentIds([])
+        setStreamingReplies({})
+      }
+      drainReadyQueue()
+    }
   }
 
   const drainReadyQueue = () => {
-    if (turnInFlightRef.current) return
-    const next = readyQueueRef.current.shift()
+    const next = takeNextReadyTurn(readyQueueRef.current, inFlightConversationsRef.current)
     if (!next) return
     runCollectedTurn(next)   // sets the in-flight flag; calls drainReadyQueue again when done
   }
@@ -935,8 +867,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
     drainReadyQueue()
   }
 
-  // The whole reply-timing mechanism: fire only once the user has gone quiet —
-  // no input activity for IDLE_MS and the input box empty — else re-check soon.
+  // The whole reply-timing mechanism: fire only once the user has gone quiet —  // no input activity for IDLE_MS and the input box empty —else re-check soon.
   // (In-flight ordering is handled by the ready queue, not here.)
   const armIdleCheck = () => {
     if (collectTimerRef.current) window.clearTimeout(collectTimerRef.current)
@@ -959,7 +890,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
     sealCurrentBatch()
   }
 
-  // A right-clicked bubble becomes a structured replyTo for the backend (it
+  // A quoted bubble becomes a structured replyTo for the backend (it
   // resolves the text by id; we send only id + who).
   const buildReplyTo = (message) => {
     if (!message?.id) return null
@@ -1006,15 +937,21 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
     if (collectRef.current) {
       collectRef.current.texts.push(text)
       collectRef.current.localMessages.push(localUserMessage)
+      collectRef.current.payload.texts = [...collectRef.current.texts]
       if (mention) collectRef.current.mention = mention
-      if (replyTo) collectRef.current.replyTo = replyTo
+      if (replyTo) {
+        collectRef.current.replyTo = replyTo
+        collectRef.current.payload.replyTo = replyTo
+      }
     } else {
+      const texts = [text]
       collectRef.current = {
-        texts: [text],
+        texts,
         mention,
         replyTo,
         localMessages: [localUserMessage],
         baseMessages: messages,
+        payload: buildTurnPayloadSnapshot(texts, messages, replyTo),
         conversationKey: historyKeyRef.current,
         conversationIdentity: conversationIdentityRef.current
       }
@@ -1072,14 +1009,14 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
       {IDLE_DEBUG && (
         <div style={{ position: 'fixed', left: 8, bottom: 8, zIndex: 9999, width: 'min(94vw, 600px)', maxHeight: '42vh', overflowY: 'auto', background: 'rgba(0,0,0,0.85)', color: '#7CFC00', font: '11px/1.45 ui-monospace, Menlo, Consolas, monospace', padding: '8px 10px', borderRadius: 8, whiteSpace: 'pre-wrap' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4, color: '#fff' }}>
-            <b>idle debug · IDLE_MS={IDLE_MS}</b>
+            <b>idle debug ? IDLE_MS={IDLE_MS}</b>
             <span>
               <button onClick={() => { navigator.clipboard?.writeText(idleEvents.join('\n')); showToast(isChinese ? '日志已复制' : 'Log copied') }} style={{ background: '#2a6', color: '#fff', border: 'none', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', marginRight: 6 }}>copy</button>
               <button onClick={() => setIdleEvents([])} style={{ background: '#444', color: '#fff', border: 'none', borderRadius: 4, padding: '2px 8px', cursor: 'pointer' }}>clear</button>
             </span>
           </div>
           {idleEvents.length === 0
-            ? <div style={{ color: '#888' }}>发条消息看这里……（📤=发送 ⌨️=停顿后又打字 🔒=封批 ➡️=入队）</div>
+            ? <div style={{ color: '#888' }}>Send a message to see idle batching logs.</div>
             : idleEvents.map((line, i) => <div key={i}>{line}</div>)}
         </div>
       )}
@@ -1124,7 +1061,6 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
               {Object.entries(streamingReplies).map(([index, entry]) => (
                 <StreamingBubble key={`stream-${index}`} agent={[...agents, bird].find(agent => agent.id === entry.agentId)} text={entry.text} isDM={isDM} />
               ))}
-              {typingAgentId && <TypingBubble agent={[...agents, bird].find(agent => agent.id === typingAgentId)} />}
               {typingAgentIds.map(agentId => <TypingBubble key={agentId} agent={[...agents, bird].find(agent => agent.id === agentId)} />)}
             </div>
 
@@ -1137,7 +1073,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
                       <span className="chirp-quote-bar-author">{quoting.type === 'agent' ? (agents.find(a => a.id === quoting.agentId)?.name || quoting.agentId) : (isChinese ? '我' : 'Me')}: </span>
                       <span className="chirp-quote-bar-snippet">{quoting.text || ''}</span>
                     </div>
-                    <button className="chirp-quote-bar-close" onClick={() => setQuoting(null)} aria-label={isChinese ? '取消引用' : 'Cancel quote'}>×</button>
+                    <button className="chirp-quote-bar-close" onClick={() => setQuoting(null)} aria-label={isChinese ? '取消引用' : 'Cancel quote'}>x</button>
                   </div>
                 )}
                 <textarea
@@ -1225,7 +1161,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
                               className="chirp-member-remove"
                               onClick={() => removeAgent(member.id)}
                               aria-label={isChinese ? `移除 ${member.name}` : `Remove ${member.name}`}
-                            >−</button>
+                            >x</button>
                           )}
                         </div>
                         <span>{member.name}</span>
@@ -1268,7 +1204,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
 
 const MessageBubble = memo(function MessageBubble({ message, agents, bird, language, onQuote, onOpenPersona, isDM }) {
   if (message.type === 'system') return null
-  // A reply icon appears on hover (no right-click); clicking it quotes this
+  // A reply icon appears on hover; clicking it quotes this
   // bubble into the composer.
   const replyButton = (
     <button
@@ -1281,8 +1217,7 @@ const MessageBubble = memo(function MessageBubble({ message, agents, bird, langu
       <ReplyIcon />
     </button>
   )
-  // Personal records (memo) render exactly like normal user messages —
-  // the classification is backend-only (framework v2: 个人记录不做特殊 UI).
+  // Personal records (memo) render exactly like normal user messages —  // the classification is backend-only (framework v2: 个人记录不做特殊 UI).
   if (message.type === 'memo' || message.type === 'user') {
     return (
       <div className="chirp-message user">

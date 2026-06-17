@@ -2,17 +2,8 @@
 // emotion perception system: it decides whether a persona should participate in
 // the current group turn, using only compact conversation facts.
 
-import { cheapChat } from './modelProvider.js'
 import { formatTargetingConversation } from './turnTargeting.js'
-
-// Kept for older tests/helpers. Current routing no longer depends on current
-// turn emotion perception to short-circuit participation.
-export function structuralObligation(perception, personaId) {
-  if (!perception) return null
-  if (perception.continues_thread_of && sameId(perception.continues_thread_of, personaId)) return 'continuation'
-  if (perception.addressed_to && sameId(perception.addressed_to, personaId)) return 'addressed'
-  return null
-}
+import { cheapChat } from './modelProvider.js'
 
 function cardSummary(template = {}) {
   const card = template.runtime_card || {}
@@ -90,8 +81,4 @@ export async function decideParticipation({
     console.warn('Chirp participation gate failed; defaulting to silent:', error.message || error)
     return { speak: false, reason: 'error' }
   }
-}
-
-function sameId(a, b) {
-  return String(a).trim().toLowerCase() === String(b).trim().toLowerCase()
 }

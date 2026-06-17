@@ -13,7 +13,7 @@ import { acquireVisibleRunLock, releaseVisibleRunLock } from '../lib/chirp/visib
 import { perceiveTurn } from '../lib/chirp/perceptionLayer.js'
 import { decideParticipation } from '../lib/chirp/participation.js'
 import { readEmotionState, readEmotionStateRow, writeEmotionState, appendEmotionLog } from '../lib/chirp/emotionStore.js'
-import { buildSpeakerPlans } from '../lib/chirp/turnPlanner.js'
+import { AMBIENT_TRIGGER_TYPES, buildSpeakerPlans } from '../lib/chirp/turnPlanner.js'
 import { assessTurnTargeting } from '../lib/chirp/turnTargeting.js'
 
 const router = Router()
@@ -523,12 +523,12 @@ async function readPriorEmotion({ ownerId, conversationId }) {
 
 // Compute this turn's emotion read with the cheap model. This is background
 // perception for the next turn / memory path, not participation routing.
-async function computeTurnPerception({ ownerId, conversationId, members, latestText, includeStructural = false, tzOffset = null }) {
+async function computeTurnPerception({ ownerId, conversationId, latestText, tzOffset = null }) {
     const [priorState, recentMessages] = await Promise.all([
         readEmotionState({ supabase: supabaseAdmin, userId: ownerId, conversationId }),
         readConversationRecent({ conversationId })
     ])
-    return perceiveTurn({ members, recentMessages, latestText, priorState, includeStructural, tzOffset })
+    return perceiveTurn({ recentMessages, latestText, priorState, tzOffset })
 }
 
 // Persist this turn's perception: the latest slice (fast prior read next turn) +
@@ -542,10 +542,10 @@ function persistTurnPerception({ ownerId, conversationId, perception }) {
 
 // Kick off this turn's emotion compute+store in the background. Never awaited
 // on the reply path.
-function schedulePerceptionStore({ ownerId, conversationId, members, latestText, tzOffset = null }) {
+function schedulePerceptionStore({ ownerId, conversationId, latestText, tzOffset = null }) {
     ;(async () => {
         const perception = await computeTurnPerception({
-            ownerId, conversationId, members, latestText, includeStructural: false, tzOffset
+            ownerId, conversationId, latestText, tzOffset
         })
         persistTurnPerception({ ownerId, conversationId, perception })
     })().catch(() => {})
@@ -562,8 +562,6 @@ async function computeTurnContext({ conversationId, members, latestText, current
     const targeting = runTargeting ? await assessTurnTargeting({ members, recentMessages, latestText }) : null
     return { recentMessages, targeting }
 }
-
-const AMBIENT_TRIGGER_TYPES = new Set(['ambient', 'group_personal_record'])
 
 function sendSse(res, event, data) {
     res.write(`event: ${event}\n`)
@@ -584,7 +582,6 @@ router.post('/chirp/turn', authenticateUser, async (req, res) => {
         schedulePerceptionStore({
             ownerId: req.user.id,
             conversationId: turn.conversationId,
-            members: turn.members,
             latestText,
             tzOffset: turn.tzOffset
         })
@@ -636,7 +633,7 @@ router.post('/chirp/turn', authenticateUser, async (req, res) => {
         const agentMessages = []
 
         for (const result of runResults.filter(Boolean)) {
-            if (classifyReply(result.reply, result.mode) === 'silence') continue
+            if (classifyReply(result.reply) === 'silence') continue
             agentMessages.push(...await saveAgentReply({
                 planetId: turn.planetId,
                 conversationId: turn.conversationId,
@@ -699,7 +696,6 @@ router.post('/chirp/turn/stream', authenticateUser, async (req, res) => {
         schedulePerceptionStore({
             ownerId: req.user.id,
             conversationId: turn.conversationId,
-            members: turn.members,
             latestText,
             tzOffset: turn.tzOffset
         })
@@ -730,7 +726,7 @@ router.post('/chirp/turn/stream', authenticateUser, async (req, res) => {
                     onReset: () => sendSse(res, 'agent_reset', { target, index })
                 })
                 sendSse(res, 'agent_finished', { target, index })
-                if (!result || classifyReply(result.reply, result.mode) === 'silence') return null
+                if (!result || classifyReply(result.reply) === 'silence') return null
                 const savedParts = await saveAgentReply({
                     planetId: turn.planetId,
                     conversationId: turn.conversationId,

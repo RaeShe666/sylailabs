@@ -8,9 +8,7 @@ const INSTANCE_SELECT = [
   'template_id',
   'user_personal_patch',
   'user_memory',
-  'interaction_skill',
-  'affective_context',
-  'relationship_stage'
+  'interaction_skill'
 ].join(',')
 
 export function mapInstanceRow(row = {}) {
@@ -20,9 +18,7 @@ export function mapInstanceRow(row = {}) {
     templateId: row.template_id,
     user_personal_patch: row.user_personal_patch || {},
     user_memory: Array.isArray(row.user_memory) ? row.user_memory : [],
-    interaction_skill: Array.isArray(row.interaction_skill) ? row.interaction_skill : [],
-    affective_context: row.affective_context || {},
-    relationship_stage: row.relationship_stage || null
+    interaction_skill: Array.isArray(row.interaction_skill) ? row.interaction_skill : []
   }
 }
 

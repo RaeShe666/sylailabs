@@ -851,7 +851,7 @@
 
 }
 
-/* Quote/reply bar above the composer (right-click a bubble to quote it) */
+/* Quote/reply bar above the composer. */
 /* Quote chip lives inside the composer box, as an integrated row above the
    textarea (separated by a hairline divider). */
 .chirp-quote-bar {

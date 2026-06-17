@@ -1,7 +1,6 @@
 // Persona runtime (persona-v2 §4): the persona is stable, the info pack is
-// rebuilt every turn from three layers —
-//   stable   = system bases + template.runtime_card  (byte-stable, prompt-cacheable)
-//   context  = instance (patch / user_memory / interaction_skill / affective_context)
+// rebuilt every turn from three layers —//   stable   = system bases + template.runtime_card  (byte-stable, prompt-cacheable)
+//   context  = instance (patch / user_memory / interaction_skill)
 //              + run info, hash-gated upstream
 //   volatile = recent window + native recall tool + latest message
 // One model pass writes the reply; at most one recall tool round per turn.
@@ -12,7 +11,7 @@ import { formatAbsTime } from './time.js'
 
 export const RECALL_TOOL = {
   name: 'recall',
-  description: 'Search this user\'s older messages within your allowed memory scope. Call it only when the latest user message points at something about THE USER\'S past that is not visible in the recent background: past events ("上次/last time"), repeated patterns ("又/again"), prior wording, or a person/topic the user mentioned before. Never call it for questions about yourself (who you are, your role, what you can do — that is in your own card), greetings, small talk, practical questions, or anything answerable from recent context. When in doubt, do not call it. Synthesize 1-3 short queries in the user\'s language; add a paraphrase when the reference is vague.',
+  description: 'Search this user\'s older messages within your allowed memory scope. Call it only when the latest user message points at something about THE USER\'S past that is not visible in the recent background: past events ("上次—/last time"), repeated patterns ("又again"), prior wording, or a person/topic the user mentioned before. Never call it for questions about yourself (who you are, your role, what you can do —that is in your own card), greetings, small talk, practical questions, or anything answerable from recent context. When in doubt, do not call it. Synthesize 1-3 short queries in the user\'s language; add a paraphrase when the reference is vague.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -39,7 +38,7 @@ Group participation turn: Chirp works like a normal private group chat. The user
 - The participation gate has already decided that you should speak in this turn; do not re-run turn-taking or explain why you are speaking.
 - Your starting point is always the user: read their intent first, then respond from your own stance, knowledge, and character.
 - Just answer as yourself. Saying something similar to, or overlapping with, another persona is completely fine.
-- You may agree with, build on, or disagree with what other personas said when you genuinely see it differently — in service of the user, never to debate or perform for another AI.
+- You may agree with, build on, or disagree with what other personas said when you genuinely see it differently —in service of the user, never to debate or perform for another AI.
 `.trim()
 
 // Multi-bubble texting (behavior base C): the model may separate bubbles with
@@ -56,19 +55,19 @@ export function splitBubbles(text, max = 6) {
 // Reply classification: 'text' shows to the user; 'silence' only covers empty
 // model output. Turn-taking is decided by the gate before runtime, not by a
 // hidden generation-side silence protocol.
-export function classifyReply(reply, mode = 'mentioned') {
+export function classifyReply(reply) {
   const text = (reply?.text || '').trim()
   if (!text) return 'silence'
   return 'text'
 }
 
 // Shared context depth: how many user-initiated turns of history both the
-// perception read and the reply background look at — the current turn plus the
+// perception read and the reply background look at —the current turn plus the
 // previous 2 full exchanges.
 export const CONTEXT_TURNS = 3
 
 // A "turn" (轮次) = one user expression block (one or more consecutive
-// user/memo bubbles — a burst) plus the agent replies it drew, until the next
+// user/memo bubbles —a burst) plus the agent replies it drew, until the next
 // user block. So a burst of several quick messages is ONE turn, not several.
 // `messages` must be chronological. Returns the tail covering the last `turns`
 // user-initiated rounds, capped at `hardCap` bubbles so a pathological round
@@ -100,11 +99,11 @@ export function findLatestUserMessage(messages = []) {
 }
 
 // A quoted/replied-to bubble the user is pointing at this turn. Surfaced above
-// the background so the persona treats it as the focus — even if it is older
+// the background so the persona treats it as the focus —even if it is older
 // than the recent window.
 export function formatQuoted(quotedContext) {
   if (!quotedContext?.text) return ''
-  return `The user is replying to / quoting this specific earlier message — treat it as exactly what they are pointing at, even if it is older than the background below:
+  return `The user is replying to / quoting this specific earlier message —treat it as exactly what they are pointing at, even if it is older than the background below:
 ${quotedContext.author}: ${quotedContext.text}
 
 `
@@ -118,7 +117,7 @@ export function formatConversation(messages = [], tzOffset = null) {
       const agentId = message.agentId || message.sender_id
       const at = formatAbsTime(message.createdAt ?? message.created_at, tzOffset)
       const stamp = at ? `[${at}] ` : ''
-      // No-@ messages are personal records — labeled by the is_personal_record
+      // No-@ messages are personal records —labeled by the is_personal_record
       // flag now, not a separate type ('memo' kept only for reading legacy rows).
       if (type === 'user' || type === 'memo') {
         return message.isPersonalRecord ? `${stamp}Personal record: ${message.text}` : `${stamp}User: ${message.text}`
@@ -159,9 +158,9 @@ function formatNoteList(label, notes = [], tzOffset = null) {
   return lines.length ? `${label}:\n${lines.join('\n')}` : ''
 }
 
-// Live perception (this turn's shared emotion read) — injected into the reply
+// Live perception (this turn's shared emotion read) —injected into the reply
 // so the persona responds to how the user feels right now, plus a hidden
-// insight only the persona sees. Replaces the old slow affective_context.
+// insight only the persona sees. Replaces the old slow affective distillation path.
 function formatPerception(perception, tzOffset = null) {
   if (!perception?.emotion_summary) return ''
   const parts = [`how they feel: ${perception.emotion_summary} (intensity ${perception.intensity}, vulnerability ${perception.vulnerability})`]
@@ -170,7 +169,7 @@ function formatPerception(perception, tzOffset = null) {
   const at = formatAbsTime(perception.capturedAt, tzOffset)
   const header = at
     ? `Your last emotional read of the user, captured ${at} (use it as background, not as if it is happening right now):`
-    : `The user's state this moment — let it shape how you respond, especially your tone:`
+    : `The user's state this moment —let it shape how you respond, especially your tone:`
   return `${header}\n${parts.map(p => `- ${p}`).join('\n')}`
 }
 
@@ -187,7 +186,7 @@ export function buildSystemBlocks({ template = {}, instance = null, planet = {},
 - Current time: ${formatAbsTime(Date.now(), tzOffset)} (all timestamps below are absolute, in the user's local timezone; judge recency against this)
 - Planet: ${planet?.name || planet?.roomName || 'Untitled Planet'}
 - Planet tone: ${planet?.tone || planet?.type || 'intimate relationship conversation'}
-- User nickname: ${user?.nickname || 'not set — do not invent a name for the user or address them by one'}
+- User nickname: ${user?.nickname || 'not set —do not invent a name for the user or address them by one'}
 - Speaking persona: ${template.name || template.id || 'persona'}
 - Members in this conversation: ${members.map(member => `${member.name}(${member.role})`).join(', ') || 'unknown'}
 - Memory scope type: ${memoryScope.type || 'persona_membership_planet'}
@@ -274,7 +273,7 @@ export async function runPersona({
   const latestMessage = findLatestUserMessage(messages)
   const latestUserMessage = stripLeadingMention(currentUserText || latestMessage?.text || '', template || {})
   // Background is the last CONTEXT_TURNS rounds (a burst counts as one), minus
-  // the current message which is shown on its own below — same turn-based window
+  // the current message which is shown on its own below —same turn-based window
   // the perception read uses.
   const windowed = takeLastTurns(messages || [])
   const currentIds = new Set((currentMessageIds || []).filter(Boolean))

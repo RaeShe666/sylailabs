@@ -3,23 +3,20 @@
 // job distills the new segment into short deltas when the conversation pauses
 // (idle) or enough turns pile up (cap), whichever comes first.
 //
-// Writes go to chirp_persona_instances: user_memory (declarative),
-// interaction_skill (procedural: how to accompany THIS user), and
-// affective_context (decaying emotional-relational state). Silent write,
-// silent recall — the reply path never waits for this.
+// Writes go to chirp_persona_instances: user_memory (declarative) and
+// interaction_skill (procedural: how to accompany THIS user). Silent recall
+// means the reply path never waits for this.
 
 import { chatTurn } from './modelProvider.js'
 import { buildMemoryScope, resolveMemoryScope } from './memoryScope.js'
 
-// Tunable knobs (产品旋钮，可调).
+// Tunable knobs (产品旋钮，可调.
 const TURN_CAP = 5                       // distill after this many persona turns
 const IDLE_MS = 5 * 60 * 1000            // ...or after this much silence
 const MIN_NEW_MESSAGES = 3               // skip tiny segments
 const SEGMENT_LIMIT = 80                 // max messages read per distill run
 const USER_MEMORY_CAP = 30               // keep long-term profile short (写入纪律)
 const SKILL_CAP = 20
-const DEFAULT_AFFECT_TTL_HOURS = 24
-const MAX_AFFECT_TTL_HOURS = 72
 
 const trackers = new Map() // instanceId -> { turns, timer, running }
 
@@ -65,7 +62,7 @@ export async function runDistillation({ supabase, userId, template, instanceId }
   try {
     const { data: instanceRow, error: instanceError } = await supabase
       .from('chirp_persona_instances')
-      .select('id,user_id,template_id,user_memory,interaction_skill,affective_context,last_distilled_at')
+      .select('id,user_id,template_id,user_memory,interaction_skill,last_distilled_at')
       .eq('id', instanceId)
       .single()
     if (instanceError) throw instanceError
@@ -91,18 +88,6 @@ export async function runDistillation({ supabase, userId, template, instanceId }
       interaction_skill: mergeNotes(existingSkills, parsed.interaction_skill, sourceIds, SKILL_CAP),
       last_distilled_at: segment.latestAt || new Date().toISOString(),
       updated_at: new Date().toISOString()
-    }
-
-    if (parsed.affective_context?.summary) {
-      const ttlHours = clampTtl(parsed.affective_context.ttl_hours)
-      update.affective_context = {
-        summary: parsed.affective_context.summary,
-        response_need: parsed.affective_context.response_need || '',
-        sensitivity: parsed.affective_context.sensitivity || 'low',
-        confidence: clamp01(parsed.affective_context.confidence),
-        evidence_message_ids: sourceIds.slice(-10),
-        expires_at: new Date(Date.now() + ttlHours * 3600 * 1000).toISOString()
-      }
     }
 
     const { error: updateError } = await supabase
@@ -156,15 +141,14 @@ function buildDistillerSystem({ template, existingMemory, existingSkills }) {
 
 Discipline:
 - Distill, don't transcribe. Short conclusions, not quotes.
-- Every note must pass three gates: durable (still true in a month), specific (names, facts, patterns — not vibes), future-leverageable (changes how the persona accompanies this user).
+- Every note must pass three gates: durable (still true in a month), specific (names, facts, patterns —not vibes), future-leverageable (changes how the persona accompanies this user).
 - Convert relative time to absolute dates. Today is ${today}.
 - Do not duplicate or rephrase existing notes (listed below). Only genuinely new information.
 - If nothing passes the gates, return empty arrays. Most small segments deserve nothing.
 
 Note types:
 - user_memory (declarative): facts and recurring patterns about the user and their relationships.
-- interaction_skill (procedural): how to accompany THIS user — style corrections they gave, what kind of response landed or fell flat.
-- affective_context: the user's current emotional-relational state. It decays; set ttl_hours for how long it stays relevant (2-72).
+- interaction_skill (procedural): how to accompany THIS user —style corrections they gave, what kind of response landed or fell flat.
 
 Existing user_memory:
 ${existingMemory.map(note => `- ${note.text}`).join('\n') || '(none)'}
@@ -173,8 +157,7 @@ Existing interaction_skill:
 ${existingSkills.map(note => `- ${note.text}`).join('\n') || '(none)'}
 
 Output ONLY valid JSON:
-{"user_memory":[{"text":"...","confidence":0.0}],"interaction_skill":[{"text":"...","confidence":0.0}],"affective_context":{"summary":"...","response_need":"...","sensitivity":"low|medium|high","confidence":0.0,"ttl_hours":24}}
-Use null for affective_context if the segment carries no meaningful emotional state.`
+{"user_memory":[{"text":"...","confidence":0.0}],"interaction_skill":[{"text":"...","confidence":0.0}]}`
 }
 
 function formatSegment(messages) {
@@ -196,10 +179,7 @@ export function parseDistillation(text) {
     const parsed = JSON.parse(jsonMatch[0])
     return {
       user_memory: normalizeNotes(parsed.user_memory),
-      interaction_skill: normalizeNotes(parsed.interaction_skill),
-      affective_context: parsed.affective_context && typeof parsed.affective_context === 'object'
-        ? parsed.affective_context
-        : null
+      interaction_skill: normalizeNotes(parsed.interaction_skill)
     }
   } catch {
     return null
@@ -236,10 +216,4 @@ function clamp01(value) {
   const num = Number(value)
   if (!Number.isFinite(num)) return 0.5
   return Math.min(1, Math.max(0, num))
-}
-
-function clampTtl(value) {
-  const num = Number(value)
-  if (!Number.isFinite(num)) return DEFAULT_AFFECT_TTL_HOURS
-  return Math.min(MAX_AFFECT_TTL_HOURS, Math.max(2, num))
 }

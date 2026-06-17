@@ -76,7 +76,6 @@ const toClientPersona = (row) => ({
   reply_policy: row.reply_policy || {},
   memory_policy: row.memory_policy || {},
   examples: Array.isArray(row.examples) ? row.examples : [],
-  lane_contract: row.lane_contract || {},
   agent_role: row.agent_role || 'persona',
   listen_mode: row.listen_mode || 'passive',
   metadata: row.metadata || {},

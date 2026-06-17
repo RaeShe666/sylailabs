@@ -1,4 +1,4 @@
-const AMBIENT_TRIGGERS = new Set(['ambient', 'group_personal_record'])
+export const AMBIENT_TRIGGER_TYPES = new Set(['ambient', 'group_personal_record'])
 const EXPLICIT_MENTION_TRIGGERS = new Set(['mention_persona', 'mention_personas', 'mention_all'])
 
 const sameId = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase()
@@ -68,7 +68,7 @@ export function buildSpeakerPlans({ isDM = false, activation = {}, agents = [], 
 
   // Ambient (no @, no quote): the FIRST gate (targeting) picks who must reply;
   // everyone else falls through to the second gate.
-  if (AMBIENT_TRIGGERS.has(triggerType)) {
+  if (AMBIENT_TRIGGER_TYPES.has(triggerType)) {
     const mustReply = targeting?.must_reply || 'none'
     if (mustReply === 'all') {
       return agents.map(agent => ({
