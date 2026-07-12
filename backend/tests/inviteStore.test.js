@@ -118,3 +118,12 @@ test('redeemInvite: 未知 RPC 错误归为 INVITE_NOT_FOUND 之外的透传', a
     (err) => err instanceof InviteError && err.code === 'INVITE_REDEEM_FAILED'
   )
 })
+
+test('createInvite: 23505 兜底读到的 winner 已过期则报创建失败', async () => {
+  const expiredWinner = { code: 'EXPIRED234', planet_id: 'p1', expires_at: '2000-01-01T00:00:00Z', status: 'pending' }
+  const db = fakeDb({ maybeSingleQueue: [null, expiredWinner], insertError: { code: '23505', message: 'duplicate key' } })
+  await assert.rejects(
+    () => createInvite({ db, planetId: 'p1', inviterId: 'u-a' }),
+    (err) => err instanceof InviteError && err.code === 'INVITE_CREATE_FAILED'
+  )
+})
