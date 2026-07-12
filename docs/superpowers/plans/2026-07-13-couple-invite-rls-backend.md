@@ -331,7 +331,7 @@ test('generateInviteCode: 10位、无易混字符、可多次生成不同值', (
 })
 
 // 最小假 client：只实现被 store 用到的链式方法
-function fakeDb({ pendingInvite = null, insertResult = null, rpcResult = null, rpcError = null } = {}) {
+function fakeDb({ pendingInvite = null, maybeSingleQueue = null, insertResult = null, insertError = null, rpcResult = null, rpcError = null } = {}) {
   const calls = { inserts: [], updates: [], rpcs: [] }
   return {
     calls,
@@ -339,12 +339,18 @@ function fakeDb({ pendingInvite = null, insertResult = null, rpcResult = null, r
       return {
         select() { return this },
         eq() { return this },
-        maybeSingle: async () => ({ data: pendingInvite, error: null }),
+        maybeSingle: async () => ({
+          data: maybeSingleQueue ? (maybeSingleQueue.length ? maybeSingleQueue.shift() : null) : pendingInvite,
+          error: null
+        }),
         insert(payload) {
           calls.inserts.push({ table, payload })
           return {
             select() { return this },
-            single: async () => ({ data: insertResult ?? { ...payload, id: 'inv-1' }, error: null })
+            single: async () =>
+              insertError
+                ? { data: null, error: insertError }
+                : { data: insertResult ?? { ...payload, id: 'inv-1' }, error: null }
           }
         },
         update(payload) {
@@ -381,6 +387,14 @@ test('createInvite: 过期的 pending 标记 expired 后新建', async () => {
   assert.equal(db.calls.updates.length, 1)
   assert.deepEqual(db.calls.updates[0].payload, { status: 'expired' })
   assert.equal(db.calls.inserts.length, 1)
+})
+
+test('createInvite: 并发撞唯一索引(23505)时重读复用', async () => {
+  const winner = { code: 'WINNER2345', planet_id: 'p1', expires_at: '2099-01-01T00:00:00Z', status: 'pending' }
+  const db = fakeDb({ maybeSingleQueue: [null, winner], insertError: { code: '23505', message: 'duplicate key' } })
+  const result = await createInvite({ db, planetId: 'p1', inviterId: 'u-a' })
+  assert.equal(result.code, 'WINNER2345')
+  assert.equal(result.reused, true)
 })
 
 test('createInvite: 无 pending 时新建并带过期时间', async () => {
@@ -489,7 +503,21 @@ export async function createInvite({ db, planetId, inviterId, ttlDays = 7 }) {
     expires_at: expiresAt
   }
   const { data, error } = await db.from('chirp_invites').insert(payload).select().single()
-  if (error) throw new InviteError('INVITE_CREATE_FAILED', error.message)
+  if (error) {
+    // > REVIEW 增补：并发双请求同时新建时，后者撞 pending 唯一索引(23505)——重读复用前者
+    if (error.code === '23505') {
+      const { data: winner } = await db
+        .from('chirp_invites')
+        .select('code, planet_id, expires_at, status')
+        .eq('planet_id', planetId)
+        .eq('status', 'pending')
+        .maybeSingle()
+      if (winner) {
+        return { code: winner.code, planetId: winner.planet_id, expiresAt: winner.expires_at, reused: true }
+      }
+    }
+    throw new InviteError('INVITE_CREATE_FAILED', error.message)
+  }
   return { code: data.code, planetId: data.planet_id, expiresAt: data.expires_at, reused: false }
 }
 

@@ -50,6 +50,8 @@ create policy chirp_messages_member_insert on public.chirp_messages
   );
 
 -- 6) planets：群成员可读所属 planet
+-- 依赖：exists 子查询以调用者身份跑，依赖上面第 3 条 chirp_conversations_member_select
+-- 让成员能看到 group 会话行；若删/收紧那条 policy，这里会对成员静默失效。
 create policy chirp_planets_member_select on public.chirp_planets
   for select using (
     exists (
