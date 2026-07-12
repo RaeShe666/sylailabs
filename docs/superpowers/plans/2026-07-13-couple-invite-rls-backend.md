@@ -110,9 +110,15 @@ create unique index if not exists chirp_invites_one_pending_per_planet
 
 alter table public.chirp_invites enable row level security;
 
--- inviter 可读可撤销自己的邀请；redeem 不走客户端
-create policy chirp_invites_inviter_all on public.chirp_invites
-  for all using (auth.uid() = inviter_id) with check (auth.uid() = inviter_id);
+-- > REVIEW 修复#1：不给客户端开 INSERT/DELETE（创建走后端 service role），
+-- > 否则任何登录用户可把 planet_id 指向他人 planet 伪造邀请、劫持会话。
+-- inviter 可读自己的邀请
+create policy chirp_invites_inviter_select on public.chirp_invites
+  for select using (auth.uid() = inviter_id);
+-- inviter 仅可把自己 pending 的邀请撤销为 revoked
+create policy chirp_invites_inviter_revoke on public.chirp_invites
+  for update using (auth.uid() = inviter_id and status = 'pending')
+  with check (auth.uid() = inviter_id and status = 'revoked');
 
 -- 成员判定辅助（SECURITY DEFINER：policy 内用它避免自引用递归）
 create or replace function public.is_chirp_conversation_member(p_conversation uuid, p_user uuid)
@@ -142,11 +148,13 @@ begin
     raise exception 'INVITE_NOT_FOUND';
   end if;
 
+  -- 该 planet 的群会话只查一次，幂等分支与主分支共用（REVIEW 修复#4）
+  select id into v_conversation_id from public.chirp_conversations
+    where planet_id = v_invite.planet_id and type = 'group'
+    order by created_at asc limit 1;
+
   -- 幂等：同一用户重复 redeem 直接返回结果
   if v_invite.status = 'redeemed' and v_invite.redeemed_by = p_user then
-    select id into v_conversation_id from public.chirp_conversations
-      where planet_id = v_invite.planet_id and type = 'group'
-      order by created_at asc limit 1;
     return jsonb_build_object('planet_id', v_invite.planet_id,
                               'conversation_id', v_conversation_id,
                               'already_redeemed', true);
@@ -154,17 +162,13 @@ begin
 
   if v_invite.status = 'revoked' then raise exception 'INVITE_REVOKED'; end if;
   if v_invite.status = 'redeemed' then raise exception 'INVITE_ALREADY_REDEEMED'; end if;
-  if v_invite.expires_at <= now() then
-    update public.chirp_invites set status = 'expired' where id = v_invite.id;
-    raise exception 'INVITE_EXPIRED';
-  end if;
   if v_invite.inviter_id = p_user then raise exception 'INVITE_SELF_REDEEM'; end if;
+  -- > REVIEW 修复#2：过期只 raise 不 update——plpgsql 的 raise 会回滚本函数事务，
+  -- > update 永远落不了库还会让 createInvite 复用到陈旧 pending 造成该 planet 邀请死锁。
+  -- > "过期"是 expires_at 的派生状态；陈旧 pending 的落库标记由 createInvite（Task 3）负责。
+  if v_invite.expires_at <= now() then raise exception 'INVITE_EXPIRED'; end if;
 
-  -- 找/建该 planet 的群会话（spec：群聊在邀请被接受后创建）
-  select id into v_conversation_id from public.chirp_conversations
-    where planet_id = v_invite.planet_id and type = 'group'
-    order by created_at asc limit 1;
-
+  -- spec：群聊在邀请被接受后创建
   if v_conversation_id is null then
     insert into public.chirp_conversations (owner_id, planet_id, type, title)
       values (v_invite.inviter_id, v_invite.planet_id, 'group', null)
@@ -299,7 +303,7 @@ git commit -m "feat(chirp): membership RLS + 一planet一群唯一键改造 (mig
 - Consumes: 注入的 supabase client（生产用 `supabaseAdmin`，测试用假 client）。
 - Produces（Task 4 路由依赖，签名精确如下）:
   - `generateInviteCode()` → 10 位大写字母+数字（去掉易混 `0O1IL`）的字符串。
-  - `createInvite({ db, planetId, inviterId, ttlDays = 7 })` → `{ code, planetId, expiresAt, reused }`；该 planet 已有 pending 邀请时返回已有那张（`reused: true`），幂等。
+  - `createInvite({ db, planetId, inviterId, ttlDays = 7 })` → `{ code, planetId, expiresAt, reused }`；该 planet 已有**未过期** pending 邀请时返回已有那张（`reused: true`），幂等；**过期的 pending 先标记为 expired 再新建**（redeem RPC 的 raise 路径不落库过期态，落库责任在这里）。
   - `getInviteByCode({ db, code })` → `{ code, status, planetId, inviterId, expiresAt } | null`。
   - `redeemInvite({ db, code, userId })` → `{ planetId, conversationId, alreadyRedeemed }`；失败 throw `InviteError`，`error.code ∈ {INVITE_NOT_FOUND, INVITE_EXPIRED, INVITE_REVOKED, INVITE_ALREADY_REDEEMED, INVITE_SELF_REDEEM}`。
   - `class InviteError extends Error { constructor(code, message) }`。
@@ -328,7 +332,7 @@ test('generateInviteCode: 10位、无易混字符、可多次生成不同值', (
 
 // 最小假 client：只实现被 store 用到的链式方法
 function fakeDb({ pendingInvite = null, insertResult = null, rpcResult = null, rpcError = null } = {}) {
-  const calls = { inserts: [], rpcs: [] }
+  const calls = { inserts: [], updates: [], rpcs: [] }
   return {
     calls,
     from(table) {
@@ -342,6 +346,14 @@ function fakeDb({ pendingInvite = null, insertResult = null, rpcResult = null, r
             select() { return this },
             single: async () => ({ data: insertResult ?? { ...payload, id: 'inv-1' }, error: null })
           }
+        },
+        update(payload) {
+          calls.updates.push({ table, payload })
+          const chain = {
+            eq() { return chain },
+            then(resolve) { resolve({ error: null }) }
+          }
+          return chain
         }
       }
     },
@@ -353,12 +365,22 @@ function fakeDb({ pendingInvite = null, insertResult = null, rpcResult = null, r
   }
 }
 
-test('createInvite: 已有 pending 时复用（幂等）', async () => {
+test('createInvite: 已有未过期 pending 时复用（幂等）', async () => {
   const db = fakeDb({ pendingInvite: { code: 'ABCDEFGH23', planet_id: 'p1', expires_at: '2099-01-01T00:00:00Z', status: 'pending' } })
   const result = await createInvite({ db, planetId: 'p1', inviterId: 'u-a' })
   assert.equal(result.code, 'ABCDEFGH23')
   assert.equal(result.reused, true)
   assert.equal(db.calls.inserts.length, 0)
+})
+
+test('createInvite: 过期的 pending 标记 expired 后新建', async () => {
+  const db = fakeDb({ pendingInvite: { code: 'OLDCODE234', planet_id: 'p1', expires_at: '2000-01-01T00:00:00Z', status: 'pending' } })
+  const result = await createInvite({ db, planetId: 'p1', inviterId: 'u-a' })
+  assert.equal(result.reused, false)
+  assert.notEqual(result.code, 'OLDCODE234')
+  assert.equal(db.calls.updates.length, 1)
+  assert.deepEqual(db.calls.updates[0].payload, { status: 'expired' })
+  assert.equal(db.calls.inserts.length, 1)
 })
 
 test('createInvite: 无 pending 时新建并带过期时间', async () => {
@@ -445,7 +467,17 @@ export async function createInvite({ db, planetId, inviterId, ttlDays = 7 }) {
     .maybeSingle()
   if (findError) throw new InviteError('INVITE_CREATE_FAILED', findError.message)
   if (existing) {
-    return { code: existing.code, planetId: existing.planet_id, expiresAt: existing.expires_at, reused: true }
+    if (new Date(existing.expires_at) > new Date()) {
+      return { code: existing.code, planetId: existing.planet_id, expiresAt: existing.expires_at, reused: true }
+    }
+    // 过期的 pending：先落库标记 expired（redeem RPC 的 raise 路径不落库过期态），
+    // 否则 partial unique index 会挡住新邀请，该 planet 的邀请功能死锁
+    const { error: expireError } = await db
+      .from('chirp_invites')
+      .update({ status: 'expired' })
+      .eq('code', existing.code)
+      .eq('status', 'pending')
+    if (expireError) throw new InviteError('INVITE_CREATE_FAILED', expireError.message)
   }
 
   const expiresAt = new Date(Date.now() + ttlDays * 24 * 60 * 60 * 1000).toISOString()
