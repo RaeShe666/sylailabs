@@ -235,10 +235,8 @@ drop index if exists public.chirp_conv_group_uniq;
 create unique index if not exists chirp_conv_group_by_planet_uniq
   on public.chirp_conversations (planet_id) where (type = 'group');
 
--- 2) type='couple'（> AUDIT: 若 chirp_planets.type 有 check 约束，在此放开；无则删除本段注释）
--- alter table public.chirp_planets drop constraint <约束名>;
--- alter table public.chirp_planets add constraint <约束名>
---   check (type in (<原值们>, 'couple'));
+-- 2) type='couple'
+-- > AUDIT (2026-07-13): 探针证明线上可直接插入 type='couple'，无 check 约束需要放开。本段无 SQL。
 
 -- 3) conversations：成员可读
 create policy chirp_conversations_member_select on public.chirp_conversations
@@ -255,8 +253,11 @@ create policy chirp_messages_member_select on public.chirp_messages
     and public.is_chirp_conversation_member(conversation_id, auth.uid())
   );
 
--- > AUDIT: 若审计确认用户消息 sender_id = auth.uid() 文本，保留 sender_id 强校验；
--- > 否则去掉 sender_id 一行（membership + sender_type 仍然兜底）。
+-- > AUDIT (2026-07-13): 线上用户消息 sender_id 是字面量 'user'（20/20 采样），不是 uuid。
+-- > 决策：member INSERT policy **保留** sender_id = auth.uid()::text 强校验——理由：
+-- > 该 policy 只服务新的成员路径（B 的前端直写，未来 couple UI 我们控制写什么），
+-- > 旧前端 'user' 写法走仓库外的既有 owner policy，不经过这条；强校验防成员冒充对方。
+-- > 配套：Task 4 要求 couple 会话的后端 insertMessage 把 sender_id 写成请求者 uuid（见 Task 4 Step 4b）。
 create policy chirp_messages_member_insert on public.chirp_messages
   for insert with check (
     conversation_id is not null
@@ -608,6 +609,14 @@ if (planet?.type === 'couple') {
 
 stream 端点用与现有"无 agent 响应"一致的收尾方式（Step 1 时确认现有空响应的 SSE 收尾写法并复用）。
 
+- [ ] **Step 4b: couple 消息归属（AUDIT 增补）**
+
+> AUDIT (2026-07-13): 线上 sender_id 是字面量 'user'，双人群里无法区分谁发的。修法：
+> `insertMessage`（chirp.js:181-198）增加规则——当会话所属 planet type='couple' 且 sender_type='user' 时，
+> `sender_id` 写请求者的 user uuid（`req.user.id`），不再写 'user'。
+> 非 couple 路径保持 'user' 原样不动（旧读取侧兼容不受影响）。
+> 读取侧兼容说明（本切片不改前端）：couple 前端 UI 下一切片按 `sender_id === 当前用户id` 分气泡，legacy 'user' 行视为 owner 的消息。
+
 - [ ] **Step 5: 全量测试 + 手工冒烟**
 
 ```powershell
@@ -712,6 +721,9 @@ const aRead = await readAs(A)
 assert('A 可读群消息(RLS)', !aRead.error && aRead.data.length > 0, aRead.error)
 const bRead = await readAs(B)
 assert('B 可读群消息(RLS)', !bRead.error && bRead.data.length > 0, bRead.error)
+// > AUDIT 增补：couple 消息必须可归属
+const bMsg = bRead.data.find(m => m.sender_id === B.userId)
+assert('B 的消息 sender_id=其uuid(归属)', Boolean(bMsg), bRead.data.slice(0, 3))
 
 if (process.env.TEST_C_EMAIL) {
   const C = await login(process.env.TEST_C_EMAIL, process.env.TEST_C_PASSWORD)
