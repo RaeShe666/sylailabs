@@ -20,9 +20,14 @@ create unique index if not exists chirp_invites_one_pending_per_planet
 
 alter table public.chirp_invites enable row level security;
 
--- inviter 可读可撤销自己的邀请；redeem 不走客户端
-create policy chirp_invites_inviter_all on public.chirp_invites
-  for all using (auth.uid() = inviter_id) with check (auth.uid() = inviter_id);
+-- inviter 可读自己的邀请
+create policy chirp_invites_inviter_select on public.chirp_invites
+  for select using (auth.uid() = inviter_id);
+
+-- inviter 仅可把自己 pending 的邀请撤销为 revoked（不开 INSERT/DELETE，创建走后端 service role）
+create policy chirp_invites_inviter_revoke on public.chirp_invites
+  for update using (auth.uid() = inviter_id and status = 'pending')
+  with check (auth.uid() = inviter_id and status = 'revoked');
 
 -- 成员判定辅助（SECURITY DEFINER：policy 内用它避免自引用递归）
 create or replace function public.is_chirp_conversation_member(p_conversation uuid, p_user uuid)
@@ -52,11 +57,13 @@ begin
     raise exception 'INVITE_NOT_FOUND';
   end if;
 
+  -- 该 planet 的群会话（幂等分支和主分支共用；spec：群聊在邀请被接受后创建）
+  select id into v_conversation_id from public.chirp_conversations
+    where planet_id = v_invite.planet_id and type = 'group'
+    order by created_at asc limit 1;
+
   -- 幂等：同一用户重复 redeem 直接返回结果
   if v_invite.status = 'redeemed' and v_invite.redeemed_by = p_user then
-    select id into v_conversation_id from public.chirp_conversations
-      where planet_id = v_invite.planet_id and type = 'group'
-      order by created_at asc limit 1;
     return jsonb_build_object('planet_id', v_invite.planet_id,
                               'conversation_id', v_conversation_id,
                               'already_redeemed', true);
@@ -64,16 +71,10 @@ begin
 
   if v_invite.status = 'revoked' then raise exception 'INVITE_REVOKED'; end if;
   if v_invite.status = 'redeemed' then raise exception 'INVITE_ALREADY_REDEEMED'; end if;
+  if v_invite.inviter_id = p_user then raise exception 'INVITE_SELF_REDEEM'; end if;
   if v_invite.expires_at <= now() then
-    update public.chirp_invites set status = 'expired' where id = v_invite.id;
     raise exception 'INVITE_EXPIRED';
   end if;
-  if v_invite.inviter_id = p_user then raise exception 'INVITE_SELF_REDEEM'; end if;
-
-  -- 找/建该 planet 的群会话（spec：群聊在邀请被接受后创建）
-  select id into v_conversation_id from public.chirp_conversations
-    where planet_id = v_invite.planet_id and type = 'group'
-    order by created_at asc limit 1;
 
   if v_conversation_id is null then
     insert into public.chirp_conversations (owner_id, planet_id, type, title)
