@@ -5,7 +5,6 @@
 
 /* Tailwind v4：只引入 theme + utilities，不引入 preflight
    （旧页面依赖下方手写 reset；preflight 待旧 CSS 退役后再开启） */
-@layer theme, base, components, utilities;
 @import 'tailwindcss/theme.css' layer(theme);
 @import 'tailwindcss/utilities.css' layer(utilities);
 
@@ -61,10 +60,7 @@
 
 /* ========================================
    以下为旧设计系统（冻结维护：新页面禁用，改到哪迁到哪）
-   包进 base 层：让 Tailwind utilities 能覆盖这里的全局 reset，
-   旧页面自己的 XxxPage.css（无层级）仍照常压过 base
    ======================================== */
-@layer base {
 
 /* CSS Reset & Root Variables */
 :root {
@@ -447,5 +443,3 @@ a:hover {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--gray-400);
 }
-
-} /* end @layer base（旧设计系统） */
