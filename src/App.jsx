@@ -1,182 +1,60 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { HashRouter, Routes, Route, NavLink, Navigate, Outlet, useNavigate, useParams } from 'react-router-dom'
 import { AuthProvider, useAuth } from './contexts/AuthContext'
 import BrandStudioPage from './pages/BrandStudioPage'
 import LoginPage from './pages/LoginPage'
-import ChirpHomePage, { OnboardingAnimalAvatar, readOnboardingProfile } from './pages/ChirpHomePage'
+import ChirpHomePage from './pages/ChirpHomePage'
+import ChirpLayout from './pages/chirp/ChirpLayout'
+import { AdvisorPage, RoomPage, DiaryPage, MePage } from './pages/chirp/placeholders'
 import './App.css'
-
-const parseRoute = () => {
-  const hash = window.location.hash.slice(1) || '/'
-  const parts = hash.split('/').filter(Boolean)
-  // Routes: / (landing), brandkit (Brand Studio download), chirp, chirp/planet/:id, login
-  return {
-    section: parts[0] || 'landing',
-    page: parts[1] || null,
-    id: parts[2] || null
-  }
-}
-
-const navigateTo = (...segments) => {
-  window.location.hash = '/' + segments.filter(Boolean).join('/')
-}
 
 const CHIRP_LANGUAGE_KEY = 'chirpUiLanguage'
 
 const readChirpLanguage = () => {
-  if (typeof window === 'undefined') return 'en'
-  return window.localStorage.getItem(CHIRP_LANGUAGE_KEY) === 'zh' ? 'zh' : 'en'
+  if (typeof window === 'undefined') return 'zh'
+  return window.localStorage.getItem(CHIRP_LANGUAGE_KEY) === 'en' ? 'en' : 'zh'
 }
 
-function AppContent() {
+/* ---------- SYL.AILABS 站点外壳（落地页 / Brand Studio，保持原顶部导航） ---------- */
+
+function SiteShell() {
   const { user, signOut } = useAuth()
-  const route = parseRoute()
-  const [currentSection, setCurrentSection] = useState(route.section)
-  const [currentPage, setCurrentPage] = useState(route.page)
-  const [currentId, setCurrentId] = useState(route.id)
-  const [chirpProfile, setChirpProfile] = useState(() => readOnboardingProfile())
-  const [chirpLanguage, setChirpLanguage] = useState(() => readChirpLanguage())
-
-  useEffect(() => {
-    const handleHashChange = () => {
-      const nextRoute = parseRoute()
-      setCurrentSection(nextRoute.section)
-      setCurrentPage(nextRoute.page)
-      setCurrentId(nextRoute.id)
-    }
-
-    if (!window.location.hash) {
-      window.location.hash = '/'
-    }
-
-    window.addEventListener('hashchange', handleHashChange)
-    return () => window.removeEventListener('hashchange', handleHashChange)
-  }, [])
-
-  useEffect(() => {
-    const refreshChirpProfile = () => {
-      setChirpProfile(readOnboardingProfile())
-    }
-    window.addEventListener('chirp:onboarding-updated', refreshChirpProfile)
-    window.addEventListener('storage', refreshChirpProfile)
-    return () => {
-      window.removeEventListener('chirp:onboarding-updated', refreshChirpProfile)
-      window.removeEventListener('storage', refreshChirpProfile)
-    }
-  }, [])
+  const navigate = useNavigate()
 
   const handleSignOut = async () => {
     await signOut()
-    navigateTo()
-  }
-
-  const changeChirpLanguage = (language) => {
-    window.localStorage.setItem(CHIRP_LANGUAGE_KEY, language)
-    setChirpLanguage(language)
-  }
-
-  const handleGlobalLogoClick = () => {
-    navigateTo()
-  }
-
-  const handleGlobalBrandTextClick = () => {
-    if (currentSection === 'chirp') {
-      navigateTo(currentSection)
-      return
-    }
-
-    navigateTo()
-  }
-
-  const chirpNavItems = [
-    { label: 'home', page: null, action: () => navigateTo('chirp') },
-    { label: 'planet', page: 'planet', action: () => navigateTo('chirp', 'planet', 'love') },
-    { label: 'persona', page: 'persona', action: () => navigateTo('chirp', 'persona') },
-    { label: 'about me', page: 'about-me', action: () => navigateTo('chirp', 'about-me') }
-  ]
-
-  const isChirpSection = currentSection === 'chirp'
-
-  if (currentSection === 'login' && !user) {
-    return <LoginPage />
-  }
-
-  if (currentSection === 'login' && user) {
-    navigateTo('chirp')
-  }
-
-  const renderContent = () => {
-    if (currentSection === 'brandkit') {
-      return <BrandStudioPage />
-    }
-
-    if (isChirpSection) {
-      return <ChirpHomePage page={currentPage} id={currentId} language={chirpLanguage} />
-    }
-
-    return (
-      <div className="landing-page">
-        <div className="landing-text">
-          <Typewriter lines={[
-            'Something is changing here.',
-            'The builder is lazy, leaving nothing here.'
-          ]} />
-        </div>
-      </div>
-    )
+    navigate('/')
   }
 
   return (
     <div className="app">
-      <nav className={`global-nav ${isChirpSection ? 'chirp-nav' : ''}`}>
+      <nav className="global-nav">
         <div className="global-nav-brand">
           <img
             src="/logo-home-transparent.png"
             alt="Logo"
             className="global-nav-logo"
-            onClick={handleGlobalLogoClick}
+            onClick={() => navigate('/')}
           />
-          <button className="global-nav-brand-text" type="button" onClick={handleGlobalBrandTextClick}>
-            {isChirpSection ? currentSection : 'SYL.AILABS'}
+          <button className="global-nav-brand-text" type="button" onClick={() => navigate('/')}>
+            SYL.AILABS
           </button>
         </div>
 
-        {isChirpSection ? (
-          <div className="global-nav-center">
-            {chirpNavItems.map(item => (
-              <button
-                className={`global-nav-home-link ${currentPage === item.page ? 'active' : ''}`}
-                type="button"
-                key={item.label}
-                onClick={item.action}
-              >
-                {item.label}
-              </button>
-            ))}
-          </div>
-        ) : (
-          <div className="global-nav-links">
-            <a
-              className={`global-nav-link ${currentSection === 'brandkit' ? 'active' : ''}`}
-              onClick={() => navigateTo('brandkit')}
-            >
-              Brand Studio
-            </a>
-            <a
-              className={`global-nav-link ${currentSection === 'chirp' ? 'active' : ''}`}
-              onClick={() => navigateTo('chirp')}
-            >
-              Chirp
-            </a>
-          </div>
-        )}
+        <div className="global-nav-links">
+          <NavLink className={({ isActive }) => `global-nav-link ${isActive ? 'active' : ''}`} to="/brandkit">
+            Brand Studio
+          </NavLink>
+          <NavLink className="global-nav-link" to="/chirp">
+            Chirp
+          </NavLink>
+        </div>
 
         <div className="global-nav-right">
-          {isChirpSection && user && chirpProfile ? (
-            <ChirpUserMenu animal={chirpProfile.animal} language={chirpLanguage} onLanguageChange={changeChirpLanguage} onSignOut={handleSignOut} />
-          ) : user ? (
-            <UserMenu user={user} language={isChirpSection ? chirpLanguage : null} onLanguageChange={isChirpSection ? changeChirpLanguage : null} onSignOut={handleSignOut} />
+          {user ? (
+            <UserMenu user={user} onSignOut={handleSignOut} />
           ) : (
-            <a className="global-nav-auth" onClick={() => navigateTo('login')}>
+            <a className="global-nav-auth" onClick={() => navigate('/login')}>
               [ Sign In ]
             </a>
           )}
@@ -184,9 +62,71 @@ function AppContent() {
       </nav>
 
       <div className="app-body">
-        {renderContent()}
+        <Outlet />
       </div>
     </div>
+  )
+}
+
+function LandingPage() {
+  return (
+    <div className="landing-page">
+      <div className="landing-text">
+        <Typewriter lines={[
+          'Something is changing here.',
+          'The builder is lazy, leaving nothing here.'
+        ]} />
+      </div>
+    </div>
+  )
+}
+
+function LoginRoute() {
+  const { user } = useAuth()
+  if (user) return <Navigate to="/chirp" replace />
+  return <LoginPage />
+}
+
+/* ---------- 旧版 Chirp 页面（隐藏不删：仅通过旧链接可达） ---------- */
+
+function LegacyChirp({ page }) {
+  const { id } = useParams()
+  const [language] = useState(readChirpLanguage)
+  return <ChirpHomePage page={page} id={id || null} language={language} />
+}
+
+function AppRoutes() {
+  return (
+    <Routes>
+      <Route path="/login" element={<LoginRoute />} />
+
+      {/* 新版 Chirp 外壳：左侧导航 + 内容区 */}
+      <Route path="/chirp" element={<ChirpLayout />}>
+        <Route index element={<Navigate to="advisor" replace />} />
+        <Route path="advisor" element={<AdvisorPage />} />
+        <Route path="room" element={<RoomPage />} />
+        <Route path="diary" element={<DiaryPage />} />
+        <Route path="me" element={<MePage />} />
+      </Route>
+
+      {/* 旧版 Chirp 路由（兼容内部链接，导航中不出现） */}
+      <Route path="/chirp/legacy" element={<LegacyChirp page={null} />} />
+      <Route path="/chirp/planet/:id" element={<LegacyChirp page="planet" />} />
+      <Route path="/chirp/persona" element={<LegacyChirp page="persona" />} />
+      <Route path="/chirp/persona-profile/:id" element={<LegacyChirp page="persona-profile" />} />
+      <Route path="/chirp/persona-dm/:id" element={<LegacyChirp page="persona-dm" />} />
+      <Route path="/chirp/persona-test/:id" element={<LegacyChirp page="persona-test" />} />
+      <Route path="/chirp/dm/:id" element={<LegacyChirp page="dm" />} />
+      <Route path="/chirp/about-me" element={<LegacyChirp page="about-me" />} />
+
+      {/* SYL.AILABS 站点 */}
+      <Route path="/" element={<SiteShell />}>
+        <Route index element={<LandingPage />} />
+        <Route path="brandkit" element={<BrandStudioPage />} />
+      </Route>
+
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
   )
 }
 
@@ -223,17 +163,6 @@ function Typewriter({ lines }) {
   )
 }
 
-function LanguageSwitch({ language, onLanguageChange }) {
-  if (!onLanguageChange) return null
-
-  return (
-    <div className="global-language-switch" role="group" aria-label={language === 'zh' ? '界面语言' : 'Interface language'}>
-      <button className={language === 'zh' ? 'active' : ''} type="button" onClick={() => onLanguageChange('zh')}>中文</button>
-      <button className={language === 'en' ? 'active' : ''} type="button" onClick={() => onLanguageChange('en')}>English</button>
-    </div>
-  )
-}
-
 function useMenuDismiss(open, setOpen) {
   const menuRef = useRef(null)
 
@@ -258,7 +187,7 @@ function useMenuDismiss(open, setOpen) {
   return menuRef
 }
 
-function UserMenu({ user, language, onLanguageChange, onSignOut }) {
+function UserMenu({ user, onSignOut }) {
   const [open, setOpen] = useState(false)
   const menuRef = useMenuDismiss(open, setOpen)
 
@@ -276,37 +205,9 @@ function UserMenu({ user, language, onLanguageChange, onSignOut }) {
           <div className="global-dropdown-info">
             <span className="global-dropdown-email">{user.email}</span>
           </div>
-          <LanguageSwitch language={language} onLanguageChange={onLanguageChange} />
           <div className="global-dropdown-divider"></div>
           <button className="global-dropdown-item" onClick={onSignOut}>
-            {language === 'zh' ? '退出登录' : 'Sign Out'}
-          </button>
-        </div>
-      )}
-    </div>
-  )
-}
-
-function ChirpUserMenu({ animal, language, onLanguageChange, onSignOut }) {
-  const [open, setOpen] = useState(false)
-  const menuRef = useMenuDismiss(open, setOpen)
-
-  const choose = (action) => {
-    setOpen(false)
-    action()
-  }
-
-  return (
-    <div className="global-profile-menu" ref={menuRef}>
-      <button className="global-nav-animal-button" type="button" onClick={() => setOpen(previous => !previous)} aria-label="Account menu" aria-expanded={open}>
-        <OnboardingAnimalAvatar animal={animal} />
-      </button>
-      {open && (
-        <div className="global-dropdown global-chirp-dropdown">
-          <LanguageSwitch language={language} onLanguageChange={onLanguageChange} />
-          <div className="global-dropdown-divider"></div>
-          <button className="global-dropdown-item" type="button" onClick={() => choose(onSignOut)}>
-            {language === 'zh' ? '退出登录' : 'Sign Out'}
+            Sign Out
           </button>
         </div>
       )}
@@ -317,7 +218,9 @@ function ChirpUserMenu({ animal, language, onLanguageChange, onSignOut }) {
 function App() {
   return (
     <AuthProvider>
-      <AppContent />
+      <HashRouter>
+        <AppRoutes />
+      </HashRouter>
     </AuthProvider>
   )
 }
