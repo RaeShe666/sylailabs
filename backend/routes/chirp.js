@@ -15,6 +15,7 @@ import { decideParticipation } from '../lib/chirp/participation.js'
 import { readEmotionState, readEmotionStateRow, writeEmotionState, appendEmotionLog } from '../lib/chirp/emotionStore.js'
 import { AMBIENT_TRIGGER_TYPES, buildSpeakerPlans } from '../lib/chirp/turnPlanner.js'
 import { assessTurnTargeting } from '../lib/chirp/turnTargeting.js'
+import { createInvite, getInviteByCode, redeemInvite, InviteError } from '../lib/couple/inviteStore.js'
 
 const router = Router()
 
@@ -85,10 +86,13 @@ async function ensureConversation({ ownerId, planetId, conversation = {}, planet
         let query = supabaseAdmin
             .from('chirp_conversations')
             .select('id')
-            .eq('owner_id', ownerId)
             .eq('type', type)
             .order('created_at', { ascending: true })
             .limit(1)
+        // group conversations are located by PLANET, not owner (one group per
+        // planet — couple partners share the same row; the unique index is
+        // planet-scoped). DM types keep the owner + null-planet lookup as-is.
+        if (type !== 'group') query = query.eq('owner_id', ownerId)
         query = planetless ? query.is('planet_id', null) : query.eq('planet_id', planetId)
         if (type === 'persona_dm' && agentId) query = query.contains('metadata', { agent_id: agentId })
         const { data, error } = await query.maybeSingle()
@@ -171,18 +175,57 @@ async function ensureConversationMembers({ conversationId, ownerId, conversation
     if (error) throw error
 }
 
-async function insertMessage({ planetId, conversationId, message, activation, runId = null, replyTo = null }) {
+/** 会话访问检查：owner 或 user 成员可访问。返回 conversation 行，否则 null。 */
+async function loadConversationForUser(conversationId, userId) {
+    const { data: conversation, error } = await supabaseAdmin
+        .from('chirp_conversations')
+        .select('id, owner_id, planet_id, type, title, metadata')
+        .eq('id', conversationId)
+        .maybeSingle()
+    if (error || !conversation) return null
+    if (conversation.owner_id === userId) return conversation
+    const { data: member } = await supabaseAdmin
+        .from('chirp_conversation_members')
+        .select('member_id')
+        .eq('conversation_id', conversationId)
+        .eq('member_type', 'user')
+        .eq('member_id', userId)
+        .maybeSingle()
+    return member ? conversation : null
+}
+
+// Planet type read (couple detection). Fails soft to null — the turn then
+// behaves like a plain group, which is the pre-couple behavior.
+async function loadPlanetType(planetId) {
+    if (!planetId) return null
+    const { data, error } = await supabaseAdmin
+        .from('chirp_planets')
+        .select('type')
+        .eq('id', planetId)
+        .maybeSingle()
+    if (error) {
+        console.warn('Chirp planet type read failed:', error.message || error)
+        return null
+    }
+    return data?.type || null
+}
+
+async function insertMessage({ planetId, conversationId, message, activation, runId = null, replyTo = null, planetType = null, senderUserId = null }) {
     // A user message is always sender_type 'user'. Whether it was a no-@
     // "personal record" lives only in is_personal_record — we no longer overload
     // sender_type with a 'memo' value (that conflated "who sent it" with "was it
     // directed", and made every "is this the user?" check silently skip no-@).
     const senderType = message.type
+    // couple groups have TWO humans, so a user message records WHO sent it
+    // (the requester's uuid). Every other path keeps the legacy 'user' literal
+    // so existing readers are untouched.
+    const userSenderId = planetType === 'couple' && senderUserId ? senderUserId : 'user'
     const payload = {
         planet_id: planetId || null,
         conversation_id: conversationId || null,
         run_id: runId,
         sender_type: senderType,
-        sender_id: message.agentId || (senderType === 'user' ? 'user' : null),
+        sender_id: message.agentId || (senderType === 'user' ? userSenderId : null),
         sender_role: senderType === 'agent'
             ? (message.agentId === 'bird' ? 'bird' : 'persona')
             : (senderType === 'user' ? 'user' : 'system'),
@@ -359,20 +402,34 @@ async function prepareTurn({ ownerId, body }) {
         throw error
     }
 
-    const conversationType = conversation?.type || 'group'
     const conversationAgentId = conversation?.agentId || conversation?.personaId || null
-    const planetId = (conversationType === 'bird_dm' || conversationType === 'persona_dm')
-        ? null
-        : await ensurePlanet({ ownerId, planet })
-    const conversationId = await ensureConversation({
-        ownerId,
-        planetId,
-        conversation: {
-            ...conversation,
-            id: conversation?.id || planet?.conversationId || null
-        },
-        planet
-    })
+
+    // A request that carries a conversationId is authorized by MEMBERSHIP
+    // (owner OR user member — couple partner B is a member, not the owner) and
+    // the planet comes from the conversation row. Never ensurePlanet here: for
+    // B that would insert a planet of their own.
+    const requestedConversationId = conversation?.id || planet?.conversationId || null
+    let conversationType = conversation?.type || 'group'
+    let planetId = null
+    let conversationId = null
+    if (requestedConversationId) {
+        const conversationRow = await loadConversationForUser(requestedConversationId, ownerId)
+        if (!conversationRow) {
+            const error = new Error('conversation not found or not accessible')
+            error.status = 403
+            error.code = 'CONVERSATION_FORBIDDEN'
+            throw error
+        }
+        conversationId = conversationRow.id
+        conversationType = conversationRow.type || conversationType
+        planetId = conversationRow.planet_id || null
+    } else {
+        planetId = (conversationType === 'bird_dm' || conversationType === 'persona_dm')
+            ? null
+            : await ensurePlanet({ ownerId, planet })
+        conversationId = await ensureConversation({ ownerId, planetId, conversation, planet })
+    }
+    const planetType = await loadPlanetType(planetId)
     await ensureConversationMembers({
         conversationId,
         ownerId,
@@ -381,7 +438,7 @@ async function prepareTurn({ ownerId, body }) {
         targetAgentId: conversationAgentId
     })
 
-    const activation = routeActivation({
+    let activation = routeActivation({
         conversation: {
             type: conversationType,
             agentId: conversation?.agentId,
@@ -391,6 +448,12 @@ async function prepareTurn({ ownerId, body }) {
         agents,
         replyTo
     })
+    // A couple group is a two-human chat: a no-@ message there is said TO the
+    // partner, never a single-user "personal record". Router untouched — the
+    // flag is corrected on the couple path only.
+    if (planetType === 'couple') {
+        activation = { ...activation, isPersonalRecord: false }
+    }
 
     const quotedContext = await loadQuotedContext({ conversationId, replyTo })
 
@@ -416,7 +479,9 @@ async function prepareTurn({ ownerId, body }) {
                 conversationId,
                 message: { type: 'user', text: batch[i], read: true },
                 activation,
-                replyTo: (quotedSnapshot && i === quotedIndex) ? quotedSnapshot : null
+                replyTo: (quotedSnapshot && i === quotedIndex) ? quotedSnapshot : null,
+                planetType,
+                senderUserId: ownerId
             }))
         }
     } catch (error) {
@@ -430,6 +495,7 @@ async function prepareTurn({ ownerId, body }) {
         members,
         agents,
         planetId,
+        planetType,
         conversationId,
         conversationType,
         activation,
@@ -573,6 +639,18 @@ router.post('/chirp/turn', authenticateUser, async (req, res) => {
     try {
         const turn = await prepareTurn({ ownerId: req.user.id, body: req.body })
         visibleRunLock = turn.visibleRunLock
+
+        // couple group, this slice: the message is stored, NO agent activates
+        // (Bird's group mode arrives in the next slice). Same response shape as
+        // a turn where every agent stayed silent.
+        if (turn.planetType === 'couple') {
+            return res.json({
+                success: true,
+                activation: turn.activation,
+                messages: turn.savedUserMessages.map(toClientMessage)
+            })
+        }
+
         const isDM = turn.conversationType === 'persona_dm' || turn.conversationType === 'bird_dm'
         const latestText = turn.savedUserMessages.map(message => message.text).join('\n')
 
@@ -661,6 +739,9 @@ router.post('/chirp/turn', authenticateUser, async (req, res) => {
         })
     } catch (error) {
         console.error('Chirp turn failed:', error)
+        if (error.code === 'CONVERSATION_FORBIDDEN') {
+            return res.status(403).json({ error: { code: error.code, message: error.message } })
+        }
         res.status(error.status || 500).json({
             success: false,
             error: error.code || error.message
@@ -685,6 +766,14 @@ router.post('/chirp/turn/stream', authenticateUser, async (req, res) => {
         visibleRunLock = turn.visibleRunLock
         sendSse(res, 'user_messages', turn.savedUserMessages.map(toClientMessage))
         sendSse(res, 'activation', turn.activation)
+
+        // couple group, this slice: message stored, no agent activates. Close
+        // with the same 'done' event a no-reply turn ends with (finally block
+        // releases the lock and ends the stream).
+        if (turn.planetType === 'couple') {
+            sendSse(res, 'done', { success: true })
+            return
+        }
 
         const isDM = turn.conversationType === 'persona_dm' || turn.conversationType === 'bird_dm'
         const latestText = turn.savedUserMessages.map(message => message.text).join('\n')
@@ -824,6 +913,60 @@ router.post('/chirp/conversations/ensure', authenticateUser, async (req, res) =>
     } catch (error) {
         console.error('Ensure conversation failed:', error)
         res.status(500).json({ success: false, error: error.message })
+    }
+})
+
+// —— couple invites ——————————————————————————————————————————————————————
+// Error envelope for this feature is uniformly { error: { code, message } }.
+
+const inviteErrorStatus = {
+    INVITE_NOT_FOUND: 404,
+    INVITE_EXPIRED: 410,
+    INVITE_REVOKED: 410,
+    INVITE_ALREADY_REDEEMED: 409,
+    INVITE_SELF_REDEEM: 400
+}
+
+// A creates (or reuses — idempotent per planet) an invite key. The requester's
+// couple planet is ensured on the way.
+router.post('/chirp/couple/invite', authenticateUser, async (req, res) => {
+    try {
+        const planetId = await ensurePlanet({ ownerId: req.user.id, planet: { type: 'couple', name: 'us' } })
+        const invite = await createInvite({ db: supabaseAdmin, planetId, inviterId: req.user.id })
+        res.json(invite)
+    } catch (err) {
+        console.error('Chirp couple invite create failed:', err)
+        const code = err instanceof InviteError ? err.code : 'INVITE_CREATE_FAILED'
+        res.status(500).json({ error: { code, message: err.message } })
+    }
+})
+
+// B previews an invite by code (status included so the accept page can render
+// expired/revoked states).
+router.get('/chirp/couple/invite/:code', authenticateUser, async (req, res) => {
+    try {
+        const invite = await getInviteByCode({ db: supabaseAdmin, code: req.params.code })
+        if (!invite) return res.status(404).json({ error: { code: 'INVITE_NOT_FOUND', message: 'invite not found' } })
+        res.json(invite)
+    } catch (err) {
+        console.error('Chirp couple invite lookup failed:', err)
+        res.status(500).json({ error: { code: 'INVITE_LOOKUP_FAILED', message: err.message } })
+    }
+})
+
+// B redeems: the SQL RPC atomically creates the planet's group conversation
+// and inserts B's membership (idempotent for the same redeemer).
+router.post('/chirp/couple/invite/:code/redeem', authenticateUser, async (req, res) => {
+    try {
+        const result = await redeemInvite({ db: supabaseAdmin, code: req.params.code, userId: req.user.id })
+        res.json(result)
+    } catch (err) {
+        if (err instanceof InviteError) {
+            const status = inviteErrorStatus[err.code] || 500
+            return res.status(status).json({ error: { code: err.code, message: err.message } })
+        }
+        console.error('Chirp couple invite redeem failed:', err)
+        res.status(500).json({ error: { code: 'INVITE_REDEEM_FAILED', message: err.message } })
     }
 })
 
