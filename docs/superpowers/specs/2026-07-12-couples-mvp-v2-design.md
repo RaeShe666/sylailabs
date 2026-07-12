@@ -15,7 +15,7 @@
 
 | 角色 | 是什么 | MVP 可见范围 |
 |---|---|---|
-| A 的私人 agent（军师） | A 的军师/朋友（**不是 A 的分身**，永远以自己的身份说话） | A 的 DM + A 的 about me 信息 |
+| A 的私人 agent（军师） | A 的军师/朋友（**不是 A 的分身**，永远以自己的身份说话） | A 的 DM + A 的 about me 信息 + A 开了「AI 模式」的日记本 |
 | B 的私人 agent（军师） | 同上，对称 | B 侧同上 |
 | Bird | 情侣共同拥有的 AI，具体用途先不限制、观察用户行为 | 群聊全部上下文 + 调解卡片提交（仅调解流程内，明示） |
 
@@ -52,6 +52,7 @@
 
 - 「我的日记」（私有）+「我们的故事」（共享，起个更 romantic 的名字）。
 - **新建日记**：弱文字提示（未来规划/旅行规划/…）。
+- **AI 模式开关**：按 用户×日记本 各自控制（"允许我的 agent 读这本"，默认关）。开启后该用户的军师可读该本；共享本同理——开关只影响自己的军师，且只暴露自己本就可见的内容（符合 agent≤主人 规则），故无需对方同意。Bird 不读日记。
 - 后面做：多模态；私人 agent 往日记里记东西（含人写/agent 写分区、"agent 写共享区须经主人确认"闸——还没想清楚写哪本怎么写）；AI 引导/comment（可选项）；轻量标记 Moment/promise/plan/unfinished。
 
 ### 模块 4：about me（MVP 仅做个人信息页壳）
@@ -71,7 +72,7 @@
 - 移除：bird_dm 会话不再创建（旧表/链路保留，入口下线）；memoryScope 跨房间裁剪规则简化为"按 agent 身份取各自会话范围"。
 - 新增：
   - 重要日期表（user_id、label、date、lunar 标记、scope=personal/couple）。
-  - 日记表（book：类型 my/ours/custom + 标题；entry：作者、时间；author_type 字段预留 agent）。
+  - 日记表（book：类型 my/ours/custom + 标题；entry：作者、时间；author_type 字段预留 agent）+ AI 模式开关表（user_id × book_id，默认关）。
   - 调解卡片表：状态机 pending_submissions → agenda_posted；私密提交内容仅 service role 可读。
 - ⚠️ 记忆架构既有定论（"Bird 拥有全量全局记忆"）在本设计中反转：Bird 只持有群聊+调解层。实施前重过 memory 决策链与 distiller 现状。
 
