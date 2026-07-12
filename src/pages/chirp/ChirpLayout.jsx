@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Navigate, Outlet } from 'react-router-dom'
-import { Sparkles, MessagesSquare, NotebookPen, CircleUserRound, Menu, X, LogOut } from 'lucide-react'
+import { Bird, Sparkles, Sofa, NotebookPen, CircleUserRound, Menu, X, LogOut } from 'lucide-react'
 import { useAuth } from '@/contexts/AuthContext'
-import { OnboardingAnimalAvatar, readOnboardingProfile, HomeBird } from '@/pages/ChirpHomePage'
+import { OnboardingAnimalAvatar, readOnboardingProfile } from '@/pages/ChirpHomePage'
 import { cn } from '@/lib/utils'
 
 const CHIRP_LANGUAGE_KEY = 'chirpUiLanguage'
@@ -13,31 +13,31 @@ const readChirpLanguage = () => {
 }
 
 const NAV_ITEMS = [
-  { to: 'advisor', icon: Sparkles, label: 'advisor' },
-  { to: 'room', icon: MessagesSquare, label: 'group chat' },
-  { to: 'diary', icon: NotebookPen, label: 'journal' },
-  { to: 'me', icon: CircleUserRound, label: 'me' }
+  { to: 'advisor', icon: Sparkles, zh: '军师', en: 'Advisor' },
+  { to: 'room', icon: Sofa, zh: '客厅', en: 'Living room' },
+  { to: 'diary', icon: NotebookPen, zh: '日记本', en: 'Journal' },
+  { to: 'me', icon: CircleUserRound, zh: '我', en: 'Me' }
 ]
 
-function NavList({ onNavigate }) {
+function NavList({ language, onNavigate }) {
   return (
-    <nav className="flex flex-col gap-0.5">
-      {NAV_ITEMS.map(({ to, icon: Icon, label }) => (
+    <nav className="flex flex-col gap-1">
+      {NAV_ITEMS.map(({ to, icon: Icon, zh, en }) => (
         <NavLink
           key={to}
           to={to}
           onClick={onNavigate}
           className={({ isActive }) =>
             cn(
-              'flex items-center gap-2.5 rounded-[var(--radius-lg)] px-3 py-2.5 text-sm font-medium transition-colors',
+              'flex items-center gap-3 rounded-2xl px-4 py-3 text-[15px] font-medium transition-colors',
               isActive
-                ? 'bg-[#69b1f0]/15 text-[var(--text-primary)]'
-                : 'text-[var(--text-secondary)] hover:bg-[var(--gray-100)] hover:text-[var(--text-primary)]'
+                ? 'bg-white text-neutral-900 shadow-sm'
+                : 'text-neutral-500 hover:bg-black/5 hover:text-neutral-700'
             )
           }
         >
-          <Icon size={18} strokeWidth={2} />
-          {label}
+          <Icon size={20} strokeWidth={2} />
+          {language === 'zh' ? zh : en}
         </NavLink>
       ))}
     </nav>
@@ -49,10 +49,10 @@ function SidebarFooter({ language, onLanguageChange, onSignOut, profile, user })
     user?.user_metadata?.display_name || user?.email?.split('@')[0] || ''
 
   return (
-    <div className="mt-auto flex flex-col gap-2.5 pt-4">
-      <div className="h-px bg-[var(--border-light)]" />
+    <div className="mt-auto flex flex-col gap-3 pt-4">
+      <div className="h-px bg-black/5" />
       <div
-        className="flex items-center gap-1 self-start rounded-full bg-[var(--gray-100)] p-0.5 text-xs"
+        className="flex items-center gap-1 self-start rounded-full bg-black/5 p-0.5 text-xs"
         role="group"
         aria-label={language === 'zh' ? '界面语言' : 'Interface language'}
       >
@@ -63,27 +63,25 @@ function SidebarFooter({ language, onLanguageChange, onSignOut, profile, user })
             onClick={() => onLanguageChange(lang)}
             className={cn(
               'cursor-pointer rounded-full border-0 px-2.5 py-1 font-medium transition-colors',
-              language === lang
-                ? 'bg-white text-[var(--text-primary)] shadow-sm'
-                : 'bg-transparent text-[var(--text-muted)]'
+              language === lang ? 'bg-white text-neutral-800 shadow-sm' : 'bg-transparent text-neutral-400'
             )}
           >
             {lang === 'zh' ? '中' : 'EN'}
           </button>
         ))}
       </div>
-      <div className="flex items-center gap-2 py-1">
-        <span className="grid size-7 shrink-0 place-items-center overflow-hidden rounded-full">
-          {profile ? <OnboardingAnimalAvatar animal={profile.animal} /> : <CircleUserRound size={18} className="text-[var(--text-muted)]" />}
+      <div className="flex items-center gap-2.5 rounded-2xl px-1 py-1">
+        <span className="grid size-8 shrink-0 place-items-center overflow-hidden rounded-full bg-white shadow-sm">
+          {profile ? <OnboardingAnimalAvatar animal={profile.animal} /> : <CircleUserRound size={18} className="text-neutral-400" />}
         </span>
-        <span className="min-w-0 flex-1 truncate text-sm text-[var(--text-secondary)]">{displayName}</span>
+        <span className="min-w-0 flex-1 truncate text-sm text-neutral-600">{displayName}</span>
         <button
           type="button"
           onClick={onSignOut}
           title={language === 'zh' ? '退出登录' : 'Sign out'}
-          className="cursor-pointer rounded-full border-0 bg-transparent p-1.5 text-[var(--text-muted)] transition-colors hover:bg-[var(--gray-100)] hover:text-[var(--text-primary)]"
+          className="cursor-pointer rounded-full border-0 bg-transparent p-2 text-neutral-400 transition-colors hover:bg-black/5 hover:text-neutral-700"
         >
-          <LogOut size={15} />
+          <LogOut size={16} />
         </button>
       </div>
     </div>
@@ -115,8 +113,8 @@ export default function ChirpLayout() {
 
   if (loading) {
     return (
-      <div className="grid h-dvh place-items-center bg-[var(--bg-secondary)]">
-        <span className="size-10 animate-pulse"><HomeBird /></span>
+      <div className="grid h-dvh place-items-center bg-[#FBF9F4]">
+        <Bird size={28} className="animate-pulse text-neutral-300" />
       </div>
     )
   }
@@ -130,11 +128,11 @@ export default function ChirpLayout() {
 
   const sidebarInner = (
     <>
-      <div className="flex items-center gap-2 px-2 pb-5 pt-0.5">
-        <span className="size-8 shrink-0"><HomeBird /></span>
-        <span className="text-base font-semibold tracking-tight text-[var(--text-primary)]">chirp</span>
+      <div className="flex items-center gap-2.5 px-3 pb-6 pt-1">
+        <Bird size={22} strokeWidth={2.2} className="text-neutral-800" />
+        <span className="text-[17px] font-semibold tracking-tight text-neutral-900">chirp</span>
       </div>
-      <NavList onNavigate={() => setDrawerOpen(false)} />
+      <NavList language={language} onNavigate={() => setDrawerOpen(false)} />
       <SidebarFooter
         language={language}
         onLanguageChange={changeLanguage}
@@ -146,13 +144,13 @@ export default function ChirpLayout() {
   )
 
   return (
-    <div className="flex h-dvh w-full bg-[var(--bg-secondary)] text-[var(--text-primary)]">
+    <div className="flex h-dvh w-full bg-[#FBF9F4] text-neutral-900">
       {/* 桌面侧栏 */}
-      <aside className="hidden w-44 shrink-0 flex-col border-r border-[var(--border-light)] bg-white px-2.5 py-4 md:flex">
+      <aside className="hidden w-60 shrink-0 flex-col border-r border-black/5 bg-[#F5F1E8] px-3 py-5 md:flex">
         {sidebarInner}
       </aside>
 
-      {/* 手机：悬浮汉堡 + 抽屉 */}
+      {/* 手机：悬浮汉堡 + 抽屉（Tolan 式） */}
       <button
         type="button"
         onClick={() => setDrawerOpen(true)}
@@ -168,12 +166,12 @@ export default function ChirpLayout() {
             onClick={() => setDrawerOpen(false)}
             aria-hidden="true"
           />
-          <div className="absolute inset-y-0 left-0 flex w-64 flex-col rounded-r-2xl bg-white px-3 py-4 shadow-2xl">
+          <div className="absolute inset-y-0 left-0 flex w-72 flex-col rounded-r-3xl bg-[#F7F4ED] px-4 py-5 shadow-2xl">
             <button
               type="button"
               onClick={() => setDrawerOpen(false)}
               aria-label={language === 'zh' ? '关闭菜单' : 'Close menu'}
-              className="absolute right-3 top-4 cursor-pointer rounded-full border-0 bg-transparent p-2 text-[var(--text-muted)] hover:bg-[var(--gray-100)]"
+              className="absolute right-3 top-4 cursor-pointer rounded-full border-0 bg-transparent p-2 text-neutral-400 hover:bg-black/5"
             >
               <X size={18} />
             </button>
