@@ -100,27 +100,27 @@ async function cleanup() {
         return
     }
     console.log('Cleaning up test data...')
-    try {
-        if (created.conversationId) {
-            await admin.from('chirp_messages').delete().eq('conversation_id', created.conversationId)
-            await admin.from('chirp_conversation_members').delete().eq('conversation_id', created.conversationId)
-            await admin.from('chirp_conversations').delete().eq('id', created.conversationId)
-        }
-        if (created.inviteCode) {
-            await admin.from('chirp_invites').delete().eq('code', created.inviteCode)
-        }
-        if (created.planetId) {
-            await admin.from('chirp_planets').delete().eq('id', created.planetId)
-        }
-    } catch (err) {
-        console.error('Cleanup (data rows) hit an error:', err.message || err)
+    if (created.conversationId) {
+        const msg = await admin.from('chirp_messages').delete().eq('conversation_id', created.conversationId)
+        if (msg.error) console.error('cleanup: chirp_messages delete failed:', msg.error.message)
+
+        const members = await admin.from('chirp_conversation_members').delete().eq('conversation_id', created.conversationId)
+        if (members.error) console.error('cleanup: chirp_conversation_members delete failed:', members.error.message)
+
+        const conv = await admin.from('chirp_conversations').delete().eq('id', created.conversationId)
+        if (conv.error) console.error('cleanup: chirp_conversations delete failed:', conv.error.message)
+    }
+    if (created.inviteCode) {
+        const inv = await admin.from('chirp_invites').delete().eq('code', created.inviteCode)
+        if (inv.error) console.error('cleanup: chirp_invites delete failed:', inv.error.message)
+    }
+    if (created.planetId) {
+        const planet = await admin.from('chirp_planets').delete().eq('id', created.planetId)
+        if (planet.error) console.error('cleanup: chirp_planets delete failed:', planet.error.message)
     }
     for (const id of created.userIds) {
-        try {
-            await admin.auth.admin.deleteUser(id)
-        } catch (err) {
-            console.error(`Cleanup (deleteUser ${id}) hit an error:`, err.message || err)
-        }
+        const { error } = await admin.auth.admin.deleteUser(id)
+        if (error) console.error(`cleanup: deleteUser ${id} failed:`, error.message)
     }
     console.log('Cleanup done.')
 }

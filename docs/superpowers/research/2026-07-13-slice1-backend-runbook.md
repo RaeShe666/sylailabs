@@ -15,6 +15,8 @@
 npx supabase db push
 ```
 
+完整 pooler 连接参数（host `aws-1-ap-southeast-1.pooler.supabase.com:5432`、user `postgres.ptmjnccknvuqekaywvib`、psql fallback 命令）见 `docs/superpowers/plans/2026-07-13-couple-invite-rls-backend.md` 的 Global Constraints 一节。
+
 会应用：
 
 - `202607130001_chirp_invites.sql`（`chirp_invites` 表 + `redeem_chirp_invite` RPC）
