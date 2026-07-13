@@ -38,7 +38,22 @@ const isUuid = (value = '') =>
     /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
 
 async function ensurePlanet({ ownerId, planet = {} }) {
-    if (planet.dbId) return planet.dbId
+    // dbId is only trusted after an ownership check: a bare "select this row"
+    // with no owner_id filter let any logged-in caller replay someone else's
+    // planet id (leaked e.g. via GET /chirp/couple/invite/:code) and have their
+    // turn routed into that planet's group conversation. A dbId that doesn't
+    // resolve to a row owned by ownerId is silently ignored (not an error) — for
+    // legitimate callers their dbId is always their own row, so this is a no-op.
+    if (planet.dbId) {
+        const { data: owned, error: ownedError } = await supabaseAdmin
+            .from('chirp_planets')
+            .select('id, type')
+            .eq('id', planet.dbId)
+            .eq('owner_id', ownerId)
+            .maybeSingle()
+        if (ownedError) throw ownedError
+        if (owned?.id) return { planetId: owned.id, planetType: owned.type }
+    }
 
     const type = planet.type || planet.id || 'love'
     const { data: existing, error: selectError } = await supabaseAdmin
@@ -50,7 +65,7 @@ async function ensurePlanet({ ownerId, planet = {} }) {
         .maybeSingle()
 
     if (selectError) throw selectError
-    if (existing?.id) return existing.id
+    if (existing?.id) return { planetId: existing.id, planetType: type }
 
     const { data, error } = await supabaseAdmin
         .from('chirp_planets')
@@ -78,11 +93,11 @@ async function ensurePlanet({ ownerId, planet = {} }) {
             .limit(1)
             .maybeSingle()
         if (racedError) throw racedError
-        if (raced?.id) return raced.id
+        if (raced?.id) return { planetId: raced.id, planetType: type }
     }
 
     if (error) throw error
-    return data.id
+    return { planetId: data.id, planetType: type }
 }
 
 async function ensureConversation({ ownerId, planetId, conversation = {}, planet = {} }) {
@@ -448,11 +463,22 @@ async function prepareTurn({ ownerId, body }) {
         planetType = conversationRow.planetType
     } else {
         const isPlanetless = conversationType === 'bird_dm' || conversationType === 'persona_dm'
-        planetId = isPlanetless ? null : await ensurePlanet({ ownerId, planet })
+        if (isPlanetless) {
+            planetId = null
+            planetType = null
+        } else {
+            // planetType comes back from ensurePlanet itself (the type it actually
+            // ensured/selected in the DB), never from the request body directly —
+            // a caller could otherwise send planet.type: 'love' alongside someone
+            // else's planet.dbId to spoof past the couple-group short-circuit
+            // below. ensurePlanet ignores an unowned dbId and falls through to its
+            // own type-based ensure, so the type this returns is always the one
+            // that was actually used to select/insert/re-select the row.
+            const ensured = await ensurePlanet({ ownerId, planet })
+            planetId = ensured.planetId
+            planetType = ensured.planetType
+        }
         conversationId = await ensureConversation({ ownerId, planetId, conversation: conversation || {}, planet })
-        // The planet type is already known from the request body here (this is
-        // the create/ensure path, not a lookup) — same default ensurePlanet uses.
-        planetType = isPlanetless ? null : (planet?.type || planet?.id || 'love')
     }
     await ensureConversationMembers({
         conversationId,
@@ -958,7 +984,7 @@ const inviteErrorStatus = {
 // couple planet is ensured on the way.
 router.post('/chirp/couple/invite', authenticateUser, async (req, res) => {
     try {
-        const planetId = await ensurePlanet({ ownerId: req.user.id, planet: { type: 'couple', name: 'us' } })
+        const { planetId } = await ensurePlanet({ ownerId: req.user.id, planet: { type: 'couple', name: 'us' } })
         const invite = await createInvite({ db: supabaseAdmin, planetId, inviterId: req.user.id })
         res.json(invite)
     } catch (err) {
