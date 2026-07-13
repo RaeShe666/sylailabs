@@ -175,39 +175,41 @@ async function ensureConversationMembers({ conversationId, ownerId, conversation
     if (error) throw error
 }
 
-/** 会话访问检查：owner 或 user 成员可访问。返回 conversation 行，否则 null。 */
+/**
+ * 会话访问检查：owner 或 user 成员可访问，join 一并取回 planet type（couple 判定用）。
+ * DB 读错误会向上抛（不再吞成 403），只有行不存在或非成员才返回 null。
+ * @param {string} conversationId - 会话 ID
+ * @param {string} userId - 请求用户 ID
+ * @returns {Promise<{id: string, owner_id: string, planet_id: string|null, type: string, title: string, metadata: object, planetType: string|null} | null>} 会话行（挂 planetType），否则 null（403 语义）
+ * @throws {Error} DB 读失败时抛出，error.status = 500
+ */
 async function loadConversationForUser(conversationId, userId) {
     const { data: conversation, error } = await supabaseAdmin
         .from('chirp_conversations')
-        .select('id, owner_id, planet_id, type, title, metadata')
+        .select('id, owner_id, planet_id, type, title, metadata, chirp_planets(type)')
         .eq('id', conversationId)
         .maybeSingle()
-    if (error || !conversation) return null
-    if (conversation.owner_id === userId) return conversation
-    const { data: member } = await supabaseAdmin
+    if (error) {
+        const dbError = new Error(`load conversation failed: ${error.message || error}`)
+        dbError.status = 500
+        throw dbError
+    }
+    if (!conversation) return null
+    const withPlanetType = { ...conversation, planetType: conversation.chirp_planets?.type ?? null }
+    if (conversation.owner_id === userId) return withPlanetType
+    const { data: member, error: memberError } = await supabaseAdmin
         .from('chirp_conversation_members')
         .select('member_id')
         .eq('conversation_id', conversationId)
         .eq('member_type', 'user')
         .eq('member_id', userId)
         .maybeSingle()
-    return member ? conversation : null
-}
-
-// Planet type read (couple detection). Fails soft to null — the turn then
-// behaves like a plain group, which is the pre-couple behavior.
-async function loadPlanetType(planetId) {
-    if (!planetId) return null
-    const { data, error } = await supabaseAdmin
-        .from('chirp_planets')
-        .select('type')
-        .eq('id', planetId)
-        .maybeSingle()
-    if (error) {
-        console.warn('Chirp planet type read failed:', error.message || error)
-        return null
+    if (memberError) {
+        const dbError = new Error(`load conversation member failed: ${memberError.message || memberError}`)
+        dbError.status = 500
+        throw dbError
     }
-    return data?.type || null
+    return member ? withPlanetType : null
 }
 
 async function insertMessage({ planetId, conversationId, message, activation, runId = null, replyTo = null, planetType = null, senderUserId = null }) {
@@ -412,7 +414,11 @@ async function prepareTurn({ ownerId, body }) {
     let conversationType = conversation?.type || 'group'
     let planetId = null
     let conversationId = null
+    let planetType = null
     if (requestedConversationId) {
+        // loadConversationForUser now joins chirp_planets in the same query, so
+        // planetType comes straight off the row — no second read, no soft-fail
+        // path that could silently mask a couple planet as a plain group.
         const conversationRow = await loadConversationForUser(requestedConversationId, ownerId)
         if (!conversationRow) {
             const error = new Error('conversation not found or not accessible')
@@ -423,18 +429,23 @@ async function prepareTurn({ ownerId, body }) {
         conversationId = conversationRow.id
         conversationType = conversationRow.type || conversationType
         planetId = conversationRow.planet_id || null
+        planetType = conversationRow.planetType
     } else {
-        planetId = (conversationType === 'bird_dm' || conversationType === 'persona_dm')
-            ? null
-            : await ensurePlanet({ ownerId, planet })
-        conversationId = await ensureConversation({ ownerId, planetId, conversation, planet })
+        const isPlanetless = conversationType === 'bird_dm' || conversationType === 'persona_dm'
+        planetId = isPlanetless ? null : await ensurePlanet({ ownerId, planet })
+        conversationId = await ensureConversation({ ownerId, planetId, conversation: conversation || {}, planet })
+        // The planet type is already known from the request body here (this is
+        // the create/ensure path, not a lookup) — same default ensurePlanet uses.
+        planetType = isPlanetless ? null : (planet?.type || planet?.id || 'love')
     }
-    const planetType = await loadPlanetType(planetId)
     await ensureConversationMembers({
         conversationId,
         ownerId,
         conversationType,
-        agents,
+        // A couple group is a two-human chat — no persona agents should ever be
+        // seeded as members of it (the M-1 fix: agents param is otherwise
+        // whatever the client sent, and a couple group must never carry one).
+        agents: planetType === 'couple' ? [] : agents,
         targetAgentId: conversationAgentId
     })
 
