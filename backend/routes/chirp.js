@@ -950,11 +950,18 @@ router.post('/chirp/conversations/ensure', authenticateUser, async (req, res) =>
     try {
         const ownerId = req.user.id
         const { conversation = {}, agents = [] } = req.body || {}
-        const type = conversation.type
+        // This route only serves "pre-build my own DM the moment I open it" —
+        // the client never has (or needs) a legitimate conversation id to pass.
+        // Refuse to trust a client-supplied id: ensureConversation() short-circuits
+        // on conversation.id with no ownership check, and the membership upsert
+        // right after would then mint the caller into ANY known conversation id
+        // (persona_dm/bird_dm/group alike) once membership RLS is enforced.
+        const { id: _ignoredConversationId, ...safeConversation } = conversation
+        const type = safeConversation.type
         if (type !== 'persona_dm' && type !== 'bird_dm') {
             return res.status(400).json({ success: false, error: 'unsupported_type' })
         }
-        const conversationId = await ensureConversation({ ownerId, planetId: null, conversation, planet: {} })
+        const conversationId = await ensureConversation({ ownerId, planetId: null, conversation: safeConversation, planet: {} })
         await ensureConversationMembers({
             conversationId,
             ownerId,
@@ -990,7 +997,7 @@ router.post('/chirp/couple/invite', authenticateUser, async (req, res) => {
     } catch (err) {
         console.error('Chirp couple invite create failed:', err)
         const code = err instanceof InviteError ? err.code : 'INVITE_CREATE_FAILED'
-        res.status(500).json({ error: { code, message: err.message } })
+        res.status(inviteErrorStatus[code] || 500).json({ error: { code, message: err.message } })
     }
 })
 

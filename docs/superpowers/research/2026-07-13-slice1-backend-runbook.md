@@ -95,6 +95,10 @@ node scripts/verifyCoupleInvite.mjs --keep
 - `SUPABASE_ANON_KEY`（anon key，用来模拟真实登录用户过 RLS）：`backend/.env` 里故意不放这个（那份文件的注释写着"千万不要用 anon key"），脚本改为直接读仓库根目录 `.env` 里前端用的 `VITE_SUPABASE_ANON_KEY`。想覆盖就设置环境变量 `SUPABASE_ANON_KEY`。
 - `API_BASE`：默认 `http://localhost:<backend/.env 的 PORT，缺省 8080>/api`，可用环境变量 `API_BASE` 覆盖（比如后端跑在别的端口/远程环境时）。
 
+## 交接注意
+
+couple 消息的"防冒充"当前防线在后端 `insertMessage`（`backend/routes/chirp.js:246`）这层 JS 逻辑——它用 service role 写入，绕过 RLS；`202607130002_chirp_membership_rls.sql` 里的 `chirp_messages_member_insert` 强校验 policy 现在形同虚设，只有未来前端改成用 anon key 直连 Supabase 写 `chirp_messages`（绕开后端路由）时才会真正上岗生效——届时前端必须显式写 `sender_id = auth.uid()`，否则 insert 会被这条 policy 拒绝。
+
 ## 关联文件
 
 - 脚本：`backend/scripts/verifyCoupleInvite.mjs`
