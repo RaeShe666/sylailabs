@@ -224,3 +224,18 @@ where conrelid = 'public.chirp_planets'::regclass;
 - 临时脚本：`backend/audit-probe-tmp.mjs`（Q1/Q2/Q3/Q5/Q6，走 supabase-js service role）+ `backend/audit-openapi-tmp.mjs`（拉取 PostgREST OpenAPI `definitions`，交叉确认列清单）。两个脚本运行后已用 `rm` 删除，未提交仓库；输出的 `audit-openapi-full-tmp.json` 中间文件也已删除。
 - `.superpowers/sdd/probe.mjs` 曾作为脚本存放位置（该目录有独立 `.gitignore` 排除全部内容），后续为保持目录整洁也已删除，不影响审计结论。
 - `chirp_planets` 探针 insert 的清理已在问题 2 节内联展示（insert -> delete -> 删除后 select 验证为空）。除此之外，全程只做只读 `select`，未修改任何既有数据行。
+
+---
+
+## PENDING 补跑结果（2026-07-13，db push 后经 pooler 直查 pg_policies）
+
+**问题 3（chirp_messages 线上 policy）已解决**，共 7 条，全部 PERMISSIVE：
+- 仓库外旧策略 4 条（planet-ownership）：`Users can read/insert/update/delete messages of own planets`（qual/with_check 均为 `planet_id IN (select id from chirp_planets where owner_id = auth.uid())`）
+- 202606150003 的 `Users can read messages of own conversations`（conversation owner SELECT）
+- 202607130002 新增：`chirp_messages_member_select`、`chirp_messages_member_insert`（含 sender_id = auth.uid() 强校验）
+
+**问题 4（chirp_planets 线上 policy）已解决**，共 2 条，全部 PERMISSIVE：
+- 仓库外旧策略：`Users can manage own planets`（FOR ALL, owner）
+- 202607130002 新增：`chirp_planets_member_select`
+
+**结论**：无任何 RESTRICTIVE policy → "membership 策略是纯 OR 扩展、不会收紧旧路径"由推断升级为已验证事实。另：migration 历史对账发现 2026-06-14~16 的 6 个 migration 当时系手动应用未记历史，本次 push 已补录（幂等跳过），历史与文件从此一致。
