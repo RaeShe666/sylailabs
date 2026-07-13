@@ -78,7 +78,7 @@
 
 ## 6. 实施切片（每片结束可给真人用）
 
-1. **切片 1**：开屏 onboarding + 军师 DM + about me 个人信息页（含邀请入口）+ 邀请/RLS/Realtime + 群聊（Bird @响应 + 四入口 + 直接说）。（后端部分已实现，commit 链 f3245e1..9bacb2b；待 db push + E2E 验收后标完成——见 2026-07-13-slice1-backend-runbook.md）
+1. **切片 1**：开屏 onboarding + 军师 DM + about me 个人信息页（含邀请入口）+ 邀请/RLS/Realtime + 群聊（Bird @响应 + 四入口 + 直接说）。（**后端已完成并验收** ✅ 2026-07-13：migration 已 push、E2E 12 断言全 PASS；前端部分未开始）
 2. **切片 2**：分开说（调解卡片）+ 重要日期表/主动日期记忆/提醒。
 3. **切片 3**：日记本（我的/我们的/新建，纯文本）。
 
