@@ -65,6 +65,22 @@ async function ensurePlanet({ ownerId, planet = {} }) {
         .select('id')
         .single()
 
+    // Lost the create race — chirp_planets_one_couple_per_owner (couple-only,
+    // partial unique index) rejected our insert; re-find under the same
+    // owner_id+type condition we selected on above, same pattern as
+    // ensureConversation's 23505 handling.
+    if (error?.code === '23505') {
+        const { data: raced, error: racedError } = await supabaseAdmin
+            .from('chirp_planets')
+            .select('id')
+            .eq('owner_id', ownerId)
+            .eq('type', type)
+            .limit(1)
+            .maybeSingle()
+        if (racedError) throw racedError
+        if (raced?.id) return raced.id
+    }
+
     if (error) throw error
     return data.id
 }
