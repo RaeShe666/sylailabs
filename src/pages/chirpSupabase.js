@@ -48,6 +48,9 @@ const toClientMessage = (row) => ({
   id: row.id,
   type: row.sender_type,
   agentId: row.sender_type === 'agent' ? row.sender_id : undefined,
+  // Raw sender id for every sender type — in a couple group a user row carries
+  // WHICH partner sent it (their uuid; legacy single-user rows carry 'user').
+  senderId: row.sender_id || undefined,
   text: row.text || '',
   tapbacks: Array.isArray(row.tapbacks) ? row.tapbacks : [],
   read: row.sender_type === 'user',

@@ -932,7 +932,10 @@ router.post('/chirp/turn/stream', authenticateUser, async (req, res) => {
             } catch (error) {
                 console.error('Chirp stream target failed:', error)
                 sendSse(res, 'agent_error', { target, index, error: error.message })
-                return null
+                // Failure marker (vs null = legit silence/no-op) so single-agent
+                // paths (couple) can surface a turn-level failure; the multi-agent
+                // fan-out below ignores results, so this is invisible to it.
+                return { failed: true, error: error.message || 'stream_target_failed' }
             }
         }
 
@@ -942,7 +945,16 @@ router.post('/chirp/turn/stream', authenticateUser, async (req, res) => {
         // (agent_started / agent_delta / agent_finished / agent_message,
         // agent_error on failure) — no new event types.
         if (isCoupleGroup) {
-            await streamTarget({ target: { agentRole: 'bird', agentId: 'bird' }, mode: 'mentioned' }, 0)
+            const coupleRun = await streamTarget({ target: { agentRole: 'bird', agentId: 'bird' }, mode: 'mentioned' }, 0)
+
+            // couple has exactly ONE agent: if that run failed the whole turn
+            // failed — report it as a top-level `error` event (the client's
+            // stream reader flips to { success: false } only on this event; a
+            // `done { success: true }` here would silently swallow the failure).
+            if (coupleRun?.failed) {
+                sendSse(res, 'error', { success: false, error: coupleRun.error })
+                return
+            }
 
             const coupleEventMessageIds = [...turn.savedUserMessages.map(message => message.id), ...agentMessageIds].filter(Boolean)
             if (coupleEventMessageIds.length) {

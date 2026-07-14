@@ -163,8 +163,13 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
     setNameEditing(false)
   }, [planetConfig.id, planetConfig.roomName, planetConfig.groupName, planetConfig.type, planetConfig.tone, planetConfig.background, planetConfig.dbId])
 
+  // couple 空间由 coupleSpace 流程保证空间/会话已存在（conversationId 已就位）：
+  // 跳过旧的 owner-only ensure —— 它对伴侣 B（非 owner）必然失败，对 A 还会顺带
+  // 创建 bird_dm。
+  const skipLegacyEnsure = planetConfig.type === 'couple' && !!planetConfig.conversationId
+
   useEffect(() => {
-    if (isDM || !user || !planetConfig?.dbId) return
+    if (isDM || !user || !planetConfig?.dbId || skipLegacyEnsure) return
     let cancelled = false
     // Just resolve/sync the conversation id; message loading is handled by the
     // dbId loader below (group messages carry planet_id, so they load fine
@@ -179,7 +184,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
         console.warn('Failed to ensure Chirp conversations:', error)
       })
     return () => { cancelled = true }
-  }, [user, planetConfig, agents])
+  }, [user, planetConfig, agents, skipLegacyEnsure])
 
   useEffect(() => {
     if (isDM) return
@@ -201,8 +206,33 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
     atBottomRef.current = true
   }, [planetConfig.id, initialAgents, planetConfig])
 
+  // Unmount with an unsent batch (the user sent something and switched pages
+  // within the idle window): fire-and-forget the collected turn so the messages
+  // are persisted instead of silently lost. The batch payload is a fully
+  // self-contained snapshot built at queue time (buildTurnPayloadSnapshot), so
+  // it never touches unmounted state. We POST the plain JSON endpoint directly
+  // — the streaming/ready-queue machinery is gone with the component, and the
+  // reply will simply be in history on the next visit.
   useEffect(() => () => {
     if (collectTimerRef.current) window.clearTimeout(collectTimerRef.current)
+    collectTimerRef.current = null
+    const pending = collectRef.current
+    collectRef.current = null
+    if (!pending?.payload) return
+    ;(async () => {
+      try {
+        const token = await getAccessToken()
+        if (!token) return
+        fetch(`${getApiBase()}/api/chirp/turn`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify(pending.payload)
+        }).catch(error => console.warn('Chirp unmount flush failed:', error))
+      } catch (error) {
+        console.warn('Chirp unmount flush failed:', error)
+      }
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
@@ -242,7 +272,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
         const remoteAgents = await loadPlanetMemberPersonas(planetConfig, getPersonasForPlanet(planetConfig), customPersonas)
         if (!cancelled) {
           setAgents(remoteAgents)
-          if (user) {
+          if (user && !skipLegacyEnsure) {
             ensureChirpConversations(user, planetConfig, remoteAgents).catch(error => {
               console.warn('Failed to sync conversation members:', error)
             })
@@ -254,7 +284,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
     }
     loadRemoteMembers()
     return () => { cancelled = true }
-  }, [planetConfig.dbId, planetConfig, user])
+  }, [planetConfig.dbId, planetConfig, user, skipLegacyEnsure])
 
   useEffect(() => {
     const refreshAgents = () => {
@@ -1057,7 +1087,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
                 return (
                   <Fragment key={message.id}>
                     {showSeparator && <div className="chirp-date">{formatChatSeparator(message.createdAt, language)}</div>}
-                    <MessageBubble message={message} agents={agents} bird={bird} language={language} onQuote={startQuote} onOpenPersona={onOpenPersona} isDM={isDM} />
+                    <MessageBubble message={message} agents={agents} bird={bird} language={language} onQuote={startQuote} onOpenPersona={onOpenPersona} isDM={isDM} isCouple={planetConfig.type === 'couple'} currentUserId={user?.id} />
                   </Fragment>
                 )
               })}
@@ -1157,7 +1187,8 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
                   {visibleMembers.map(member => {
                     // A group needs at least 3 members, so removal is only offered
                     // once we are above that floor; the user (self) is never removable.
-                    const removable = member.id !== 'user' && memberCount > 3
+                    // couple 空间成员固定（两个人 + Bird）：不提供任何增删控件。
+                    const removable = planetConfig.type !== 'couple' && member.id !== 'user' && memberCount > 3
                     return (
                       <div className="chirp-member" key={member.id}>
                         <div className="chirp-member-avatar-wrap">
@@ -1175,7 +1206,9 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
                       </div>
                     )
                   })}
-                  <button className="chirp-member-action" onClick={addPersonaFromCommunity} aria-label={isChinese ? '添加成员' : 'Add member'}><b>+</b></button>
+                  {planetConfig.type !== 'couple' && (
+                    <button className="chirp-member-action" onClick={addPersonaFromCommunity} aria-label={isChinese ? '添加成员' : 'Add member'}><b>+</b></button>
+                  )}
                 </div>
               </section>
 
@@ -1209,7 +1242,7 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
   )
 }
 
-const MessageBubble = memo(function MessageBubble({ message, agents, bird, language, onQuote, onOpenPersona, isDM }) {
+const MessageBubble = memo(function MessageBubble({ message, agents, bird, language, onQuote, onOpenPersona, isDM, isCouple = false, currentUserId = null }) {
   if (message.type === 'system') return null
   // A reply icon appears on hover; clicking it quotes this
   // bubble into the composer.
@@ -1226,6 +1259,37 @@ const MessageBubble = memo(function MessageBubble({ message, agents, bird, langu
   )
   // Personal records (memo) render exactly like normal user messages —  // the classification is backend-only (framework v2: 个人记录不做特殊 UI).
   if (message.type === 'memo' || message.type === 'user') {
+    // couple 群里有两个真人：user 行的 senderId 是发送者 uuid，只有等于当前用户
+    // 才渲染在右侧。senderId 缺失或为 'user'（单人期 legacy 行）一律视为自己。
+    // 非 couple 模式不做任何区分（行为不变）。
+    const isPartnerMessage = isCouple
+      && !!message.senderId
+      && message.senderId !== 'user'
+      && message.senderId !== currentUserId
+    if (isPartnerMessage) {
+      // 对方（伴侣）的消息：左侧、沿用现有左侧气泡结构，但 sender 仍是 user ——
+      // 头像用 UserAvatar（不是 Bird/persona），名字显示 Partner 占位。
+      return (
+        <div className="chirp-message agent">
+          <div className="chirp-agent-side-avatar" style={{ backgroundColor: '#F5C878' }}><UserAvatar /></div>
+          <div className="chirp-agent-message-body">
+            <span className="chirp-agent-name">{language === 'zh' ? '伴侣' : 'Partner'}</span>
+            <div className="chirp-bubble-row">
+              <div className="chirp-bubble-stack">
+                {message.quoted && (
+                  <div className="chirp-quoted-ref">
+                    <span className="chirp-quoted-ref-author">{message.quoted.author}: </span>
+                    {message.quoted.text}
+                  </div>
+                )}
+                <div className="chirp-bubble">{message.text}</div>
+              </div>
+              {replyButton}
+            </div>
+          </div>
+        </div>
+      )
+    }
     return (
       <div className="chirp-message user">
         <div className="chirp-user-message-body">
@@ -1275,6 +1339,8 @@ const MessageBubble = memo(function MessageBubble({ message, agents, bird, langu
   && prev.bird === next.bird
   && prev.language === next.language
   && prev.isDM === next.isDM
+  && prev.isCouple === next.isCouple
+  && prev.currentUserId === next.currentUserId
   && prev.onOpenPersona === next.onOpenPersona
 ))
 
