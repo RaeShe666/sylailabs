@@ -397,7 +397,8 @@ export const getPlanetById = (planetId) => hydratePlanet(
 )
 
 export const getPersonasForPlanet = (planet) => {
-  const defaultIds = planet?.agents || CHIRP_PLANETS[0].agents
+  // ?? 而不是 ||：couple 空间显式传 agents: []（无 persona），空数组不能回退到 love 默认
+  const defaultIds = planet?.agents ?? CHIRP_PLANETS[0].agents
   const addedIds = readPlanetPersonaIds()[planet?.id] || []
   const allPersonas = getAllPersonas()
 

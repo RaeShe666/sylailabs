@@ -450,9 +450,9 @@ async function prepareTurn({ ownerId, body }) {
     // B that would insert a planet of their own.
     const requestedConversationId = conversation?.id || planet?.conversationId || null
     let conversationType = conversation?.type || 'group'
-    let planetId = null
-    let conversationId = null
-    let planetType = null
+    let planetId
+    let conversationId
+    let planetType
     if (requestedConversationId) {
         // loadConversationForUser now joins chirp_planets in the same query, so
         // planetType comes straight off the row — no second read, no soft-fail

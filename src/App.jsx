@@ -3,7 +3,11 @@ import { AuthProvider, useAuth } from './contexts/AuthContext'
 import BrandStudioPage from './pages/BrandStudioPage'
 import LoginPage from './pages/LoginPage'
 import ChirpHomePage, { OnboardingAnimalAvatar, readOnboardingProfile } from './pages/ChirpHomePage'
+import ChirpAppShell from './pages/chirp/ChirpAppShell'
 import './App.css'
+
+// 新版 chirp 壳承接的页面；其余 page（planet/persona/dm/about-me/home…）落到旧版页面（隐藏不删）
+const CHIRP_SHELL_PAGES = [null, 'space', 'journal', 'me']
 
 const parseRoute = () => {
   const hash = window.location.hash.slice(1) || '/'
@@ -104,13 +108,19 @@ function AppContent() {
     navigateTo('chirp')
   }
 
+  // 新版 chirp：全屏沉浸壳（无顶部导航），onboarding → 单窗口对话 + 抽屉功能栏
+  if (isChirpSection && CHIRP_SHELL_PAGES.includes(currentPage)) {
+    return <ChirpAppShell page={currentPage} />
+  }
+
   const renderContent = () => {
     if (currentSection === 'brandkit') {
       return <BrandStudioPage />
     }
 
     if (isChirpSection) {
-      return <ChirpHomePage page={currentPage} id={currentId} language={chirpLanguage} />
+      // 旧版页面（planet/persona/dm 等深链）；'home' 显式指旧首页
+      return <ChirpHomePage page={currentPage === 'home' ? null : currentPage} id={currentId} language={chirpLanguage} />
     }
 
     return (

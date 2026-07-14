@@ -51,7 +51,7 @@ const mergePersonas = (...groups) => {
   return [...byId.values()]
 }
 
-const HomeBird = () => (
+export const HomeBird = () => (
   <svg viewBox="0 0 100 100" fill="none" stroke="#1F1F1F" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
     <path d="M30 58 C30 46 38 34 52 34 C66 34 74 44 72 56 C70 66 60 70 48 70 C38 70 30 66 30 58 Z" fill="#DCC4EA" />
     <path d="M30 62 L18 66 L24 70 Z" />
@@ -305,7 +305,7 @@ export const readOnboardingProfile = () => {
   }
 }
 
-const saveOnboardingProfile = (profile) => {
+export const saveOnboardingProfile = (profile) => {
   if (profile) {
     window.localStorage.setItem(CHIRP_PROFILE_KEY, JSON.stringify(profile))
   } else {
@@ -1121,7 +1121,7 @@ function MomentsPage({ user, getAccessToken, planets }) {
   )
 }
 
-function ChirpOnboarding({ onComplete, existingProfile, language }) {
+export function ChirpOnboarding({ onComplete, existingProfile, language }) {
   const [screen, setScreen] = useState('intro')
   const [answers, setAnswers] = useState({})
   const [thing, setThing] = useState('')

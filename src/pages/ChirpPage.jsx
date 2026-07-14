@@ -37,6 +37,8 @@ const getApiBase = () => {
 }
 
 const createInitialMessages = (planet) => {
+  // couple 空间没有演示种子消息：历史来自真实会话，空态就是空
+  if (planet?.type === 'couple') return []
   return [
     { id: 'm1', type: 'user', isPersonalRecord: true, text: 'He only replied "mm" today. I want to act like it is fine, but I keep thinking about it.', createdAt: Date.now() - 1000 * 60 * 4 },
     { id: 'm2', type: 'user', text: '@Danzong is this getting cold?', read: true, createdAt: Date.now() - 1000 * 60 * 3 },
@@ -334,7 +336,8 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
   // single member is bird; in a group / persona DM it's the user + the agents.
   const visibleMembers = [
     { id: 'user', name: userProfile.nickname || 'S', color: '#F5C878', avatar: UserAvatar },
-    ...(isBirdDM ? [bird] : agents)
+    // couple 空间：bird 是常驻成员（唯一的 AI）；旧多 persona 群维持 bird 不在群的规则
+    ...(isBirdDM || planetConfig.type === 'couple' ? [bird] : agents)
   ]
   const memberCount = visibleMembers.length
   const RoomAvatar = planetConfig.avatar || DeerAvatar
@@ -1108,7 +1111,11 @@ function ChirpPage({ planetConfig = CHIRP_PLANETS[0], onBack, language = 'en', o
                       setMentionOpen(false)
                     }
                   }}
-                  placeholder={isChinese ? '@ 开始对话' : '@ to start a conversation'}
+                  placeholder={
+                    planetConfig.type === 'couple'
+                      ? (isChinese ? '说点什么…' : 'Say something…')
+                      : (isChinese ? '@ 开始对话' : '@ to start a conversation')
+                  }
                 />
                 <div className="chirp-composer-bar">
                   <button className="chirp-upload-button" type="button" aria-label={isChinese ? '上传图片' : 'Upload image'} onClick={() => fileInputRef.current?.click()}>+</button>
