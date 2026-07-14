@@ -33,6 +33,14 @@ export async function runBird({ planet, user, members, messages, memoryScope, re
       : windowed.slice(0, -1)
 
   const tzOffset = typeof user?.tzOffset === 'number' ? user.tzOffset : null
+  // Couple shared space: one scene-level note (persona untouched, no new
+  // identity here — Rae will spec details later). It supersedes the group-chat
+  // mention-only / read-broadly notes in the stable block above, matching the
+  // narrowed couple_group_bird memory scope enforced DB-side.
+  const isCoupleGroup = memoryScope?.type === 'couple_group_bird'
+  const sceneLine = isCoupleGroup
+    ? "- Scene: you are in a couple's shared space — a private group chat between two partners; here you reply to every message directly (no mention needed) and everything you can see or recall is limited to this conversation only (this supersedes the mention-only and read-broadly notes above)."
+    : '- Bird may read broadly, but raw Bird-DM text must not be quoted in group chat.'
   const system = [
     { text: [SAFETY_PRIVACY_BASE, BEHAVIOR_BASE, BIRD_SYSTEM].join('\n\n'), cache: true },
     {
@@ -42,7 +50,7 @@ export async function runBird({ planet, user, members, messages, memoryScope, re
 - User nickname: ${user?.nickname || 'not set — do not invent a name for the user or address them by one'}
 - Members in this conversation: ${(members || []).map(member => `${member.name}(${member.role})`).join(', ') || 'unknown'}
 - Memory scope type: ${memoryScope?.type || 'global_bird'}
-- Bird may read broadly, but raw Bird-DM text must not be quoted in group chat.
+${sceneLine}
 
 ${BIRD_REPLY_RULES}`
     }

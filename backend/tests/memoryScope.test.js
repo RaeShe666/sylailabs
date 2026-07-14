@@ -1,6 +1,6 @@
 ﻿import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildMemoryScope, canReadConversation, canReadMessage } from '../lib/chirp/memoryScope.js'
+import { buildMemoryScope, canReadConversation, canReadMessage, resolveMemoryScope } from '../lib/chirp/memoryScope.js'
 
 test('persona scope is tied to membership and planet, not global history', () => {
   const scope = buildMemoryScope({
@@ -50,6 +50,63 @@ test('persona can only read allowed conversation ids after scope resolution', ()
   assert.equal(canReadMessage(scope, { conversation_id: 'dm-danzong', conversation_type: 'persona_dm' }), true)
   assert.equal(canReadMessage(scope, { conversation_id: 'dm-barry', conversation_type: 'persona_dm' }), false)
   assert.equal(canReadMessage(scope, { conversation_id: 'group-work', conversation_type: 'group' }), false)
+})
+
+test('couple group bird scope is narrowed to that single conversation, never any DM', () => {
+  const scope = buildMemoryScope({
+    conversationId: 'couple-group-1',
+    planetId: 'planet-couple',
+    conversationType: 'group',
+    planetType: 'couple',
+    target: { agentRole: 'bird', agentId: 'bird' }
+  })
+
+  assert.equal(scope.type, 'couple_group_bird')
+  assert.equal(scope.raw_bird_dm_visible, false)
+  assert.equal(scope.raw_persona_dm_visible, false)
+
+  // only the couple group conversation itself is readable
+  assert.equal(canReadConversation(scope, { id: 'couple-group-1', type: 'group', planet_id: 'planet-couple' }), true)
+  assert.equal(canReadConversation(scope, { id: 'bird-dm-a', type: 'bird_dm', planet_id: null }), false)
+  assert.equal(canReadConversation(scope, { id: 'dm-danzong', type: 'persona_dm', planet_id: null }), false)
+  assert.equal(canReadConversation(scope, { id: 'group-love', type: 'group', planet_id: 'planet-love' }), false)
+
+  assert.equal(canReadMessage(scope, { conversation_id: 'couple-group-1', conversation_type: 'group' }), true)
+  assert.equal(canReadMessage(scope, { conversation_id: 'bird-dm-a', conversation_type: 'bird_dm' }), false)
+  assert.equal(canReadMessage(scope, { conversation_id: 'dm-danzong', conversation_type: 'persona_dm' }), false)
+})
+
+test('resolveMemoryScope for couple group bird queries ONLY that conversation id (no owner-wide bird read)', async () => {
+  const queries = []
+  const fakeSupabase = {
+    from(table) {
+      return {
+        select() { return this },
+        eq(column, value) {
+          queries.push({ table, column, value })
+          return Promise.resolve({
+            data: [{ id: 'couple-group-1', type: 'group', planet_id: 'planet-couple' }],
+            error: null
+          })
+        }
+      }
+    }
+  }
+
+  const scope = buildMemoryScope({
+    conversationId: 'couple-group-1',
+    planetId: 'planet-couple',
+    conversationType: 'group',
+    planetType: 'couple',
+    target: { agentRole: 'bird', agentId: 'bird' }
+  })
+
+  const resolved = await resolveMemoryScope({ supabase: fakeSupabase, ownerId: 'user-a', scope })
+
+  assert.deepEqual(resolved.allowed_conversation_ids, ['couple-group-1'])
+  // exactly one lookup, by conversation id — NOT bird's owner_id-wide read
+  // (which would sweep in every conversation including DMs)
+  assert.deepEqual(queries, [{ table: 'chirp_conversations', column: 'id', value: 'couple-group-1' }])
 })
 
 test('persona conversation filtering rejects bird dm and other planets', () => {

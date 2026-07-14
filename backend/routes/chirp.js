@@ -23,6 +23,10 @@ const toClientMessage = (row) => ({
     id: row.id,
     type: row.sender_type,
     agentId: row.sender_type === 'agent' ? row.sender_id : undefined,
+    // Raw sender id for every sender type — in a couple group a user row
+    // carries WHICH partner sent it (their uuid; legacy rows carry 'user').
+    // Old clients simply ignore the extra field.
+    senderId: row.sender_id ?? undefined,
     senderRole: row.sender_role,
     conversationId: row.conversation_id,
     planetId: row.planet_id,
@@ -278,7 +282,7 @@ async function insertMessage({ planetId, conversationId, message, activation, ru
     return data
 }
 
-async function createRun({ ownerId, conversationId, planetId, conversationType, target, triggerType }) {
+async function createRun({ ownerId, conversationId, planetId, conversationType, planetType = null, target, triggerType }) {
     const payload = {
         owner_id: ownerId,
         conversation_id: conversationId || null,
@@ -286,7 +290,7 @@ async function createRun({ ownerId, conversationId, planetId, conversationType, 
         agent_id: target.agentId,
         agent_role: target.agentRole,
         trigger_type: triggerType,
-        memory_scope: buildMemoryScope({ conversationId, planetId, conversationType, target }),
+        memory_scope: buildMemoryScope({ conversationId, planetId, conversationType, planetType, target }),
         status: 'running'
     }
 
@@ -314,7 +318,7 @@ async function finishRun(runId, status, metadata = {}) {
     if (error) console.warn('Failed to update Chirp run:', error)
 }
 
-async function executeTargetRun({ ownerId, conversationId, planetId, conversationType, target, triggerType, planet, user, members, onText = null, onReset = null, mode = 'mentioned', perception = null, quotedContext = null, currentUserText = null, currentMessageIds = [] }) {
+async function executeTargetRun({ ownerId, conversationId, planetId, conversationType, planetType = null, target, triggerType, planet, user, members, onText = null, onReset = null, mode = 'mentioned', perception = null, quotedContext = null, currentUserText = null, currentMessageIds = [] }) {
     let template = null
 
     if (target.agentRole !== 'bird') {
@@ -330,6 +334,9 @@ async function executeTargetRun({ ownerId, conversationId, planetId, conversatio
         conversationId,
         planetId,
         conversationType,
+        // planetType='couple' narrows bird from owner-wide to THIS conversation
+        // (couple_group_bird) — the couple-group memory boundary.
+        planetType,
         target
     })
 
@@ -343,7 +350,7 @@ async function executeTargetRun({ ownerId, conversationId, planetId, conversatio
         template
             ? ensureInstance({ supabase: supabaseAdmin, userId: ownerId, templateId: template.dbId })
             : Promise.resolve(null),
-        createRun({ ownerId, conversationId, planetId, conversationType, target, triggerType }),
+        createRun({ ownerId, conversationId, planetId, conversationType, planetType, target, triggerType }),
         resolveMemoryScope({ supabase: supabaseAdmin, ownerId, scope: memoryScope }),
         readConversationRecent({ conversationId })
     ])
@@ -510,7 +517,10 @@ async function prepareTurn({ ownerId, body }) {
 
     const quotedContext = await loadQuotedContext({ conversationId, replyTo })
 
-    const visibleRunLock = activation.targets.length
+    // couple v0: Bird replies to every user turn (no @ needed), so a couple
+    // turn always runs a visible agent even though the router leaves targets
+    // empty (router untouched — the handlers' couple branch runs Bird).
+    const visibleRunLock = (activation.targets.length || planetType === 'couple')
         ? await acquireVisibleRunLock({
             supabase: supabaseAdmin,
             ownerId,
@@ -693,14 +703,53 @@ router.post('/chirp/turn', authenticateUser, async (req, res) => {
         const turn = await prepareTurn({ ownerId: req.user.id, body: req.body })
         visibleRunLock = turn.visibleRunLock
 
-        // couple group, this slice: the message is stored, NO agent activates
-        // (Bird's group mode arrives in the next slice). Same response shape as
-        // a turn where every agent stayed silent.
+        // couple group v0: Bird replies to every turn directly (single or both
+        // partners present — no @ needed). One bird run per turn; personas never
+        // activate here. Perception is skipped on this path: runBird has no
+        // perception input today (it only shapes persona replies), so computing
+        // it would be a dead model call. Memory boundary: planetType='couple'
+        // narrows bird's scope to THIS conversation (couple_group_bird).
         if (turn.planetType === 'couple') {
+            const result = await executeTargetRun({
+                ownerId: req.user.id,
+                conversationId: turn.conversationId,
+                planetId: turn.planetId,
+                conversationType: turn.conversationType,
+                planetType: turn.planetType,
+                target: { agentRole: 'bird', agentId: 'bird' },
+                triggerType: 'couple_group_bird',
+                planet: turn.planet,
+                user: turn.user,
+                members: turn.members,
+                quotedContext: turn.quotedContext,
+                currentUserText: turn.currentUserText,
+                currentMessageIds: turn.currentMessageIds
+            })
+            const agentMessages = (result && classifyReply(result.reply) !== 'silence')
+                ? await saveAgentReply({
+                    planetId: turn.planetId,
+                    conversationId: turn.conversationId,
+                    result
+                })
+                : []
+
+            const eventMessageIds = [...turn.savedUserMessages.map(message => message.id), ...agentMessages.map(message => message.id)].filter(Boolean)
+            if (eventMessageIds.length) {
+                recordInteractionEvent({
+                    supabase: supabaseAdmin,
+                    userId: req.user.id,
+                    planetId: turn.planetId,
+                    conversationId: turn.conversationId,
+                    conversationType: turn.conversationType,
+                    speakerId: 'user',
+                    messageIds: eventMessageIds
+                }).catch(() => {})
+            }
+
             return res.json({
                 success: true,
                 activation: turn.activation,
-                messages: turn.savedUserMessages.map(toClientMessage)
+                messages: [...turn.savedUserMessages.map(toClientMessage), ...agentMessages]
             })
         }
 
@@ -749,6 +798,7 @@ router.post('/chirp/turn', authenticateUser, async (req, res) => {
                 conversationId: turn.conversationId,
                 planetId: turn.planetId,
                 conversationType: turn.conversationType,
+                planetType: turn.planetType,
                 target: plan.target,
                 triggerType: turn.activation.triggerType,
                 planet: turn.planet,
@@ -820,27 +870,26 @@ router.post('/chirp/turn/stream', authenticateUser, async (req, res) => {
         sendSse(res, 'user_messages', turn.savedUserMessages.map(toClientMessage))
         sendSse(res, 'activation', turn.activation)
 
-        // couple group, this slice: message stored, no agent activates. Close
-        // with the same 'done' event a no-reply turn ends with (finally block
-        // releases the lock and ends the stream).
-        if (turn.planetType === 'couple') {
-            sendSse(res, 'done', { success: true })
-            return
-        }
-
         const isDM = turn.conversationType === 'persona_dm' || turn.conversationType === 'bird_dm'
+        const isCoupleGroup = turn.planetType === 'couple'
         const latestText = turn.savedUserMessages.map(message => message.text).join('\n')
 
         // Reply tone uses the PREVIOUS turn's stored emotion (cheap read, no model
         // wait). This turn's emotion+insight is stored in the background for next
-        // turn + trajectory.
-        const priorEmotion = await readPriorEmotion({ ownerId: req.user.id, conversationId: turn.conversationId })
-        schedulePerceptionStore({
-            ownerId: req.user.id,
-            conversationId: turn.conversationId,
-            latestText,
-            tzOffset: turn.tzOffset
-        })
+        // turn + trajectory. couple v0 skips both: runBird has no perception input
+        // today (it only shapes persona replies), so computing/storing it would be
+        // a dead model call per turn.
+        const priorEmotion = isCoupleGroup
+            ? null
+            : await readPriorEmotion({ ownerId: req.user.id, conversationId: turn.conversationId })
+        if (!isCoupleGroup) {
+            schedulePerceptionStore({
+                ownerId: req.user.id,
+                conversationId: turn.conversationId,
+                latestText,
+                tzOffset: turn.tzOffset
+            })
+        }
         // Parallel fan-out — first done, first shown.
         const agentMessageIds = []
 
@@ -854,8 +903,9 @@ router.post('/chirp/turn/stream', authenticateUser, async (req, res) => {
                     conversationId: turn.conversationId,
                     planetId: turn.planetId,
                     conversationType: turn.conversationType,
+                    planetType: turn.planetType,
                     target,
-                    triggerType: turn.activation.triggerType,
+                    triggerType: isCoupleGroup ? 'couple_group_bird' : turn.activation.triggerType,
                     planet: turn.planet,
                     user: turn.user,
                     members: turn.members,
@@ -884,6 +934,31 @@ router.post('/chirp/turn/stream', authenticateUser, async (req, res) => {
                 sendSse(res, 'agent_error', { target, index, error: error.message })
                 return null
             }
+        }
+
+        // couple group v0: Bird replies to every turn directly (single or both
+        // partners — no @ needed); personas never activate here. Exactly one
+        // bird run, streamed with the SAME event sequence any agent uses
+        // (agent_started / agent_delta / agent_finished / agent_message,
+        // agent_error on failure) — no new event types.
+        if (isCoupleGroup) {
+            await streamTarget({ target: { agentRole: 'bird', agentId: 'bird' }, mode: 'mentioned' }, 0)
+
+            const coupleEventMessageIds = [...turn.savedUserMessages.map(message => message.id), ...agentMessageIds].filter(Boolean)
+            if (coupleEventMessageIds.length) {
+                recordInteractionEvent({
+                    supabase: supabaseAdmin,
+                    userId: req.user.id,
+                    planetId: turn.planetId,
+                    conversationId: turn.conversationId,
+                    conversationType: turn.conversationType,
+                    speakerId: 'user',
+                    messageIds: coupleEventMessageIds
+                }).catch(() => {})
+            }
+
+            sendSse(res, 'done', { success: true })
+            return
         }
 
         // Unified funnel: hard targets start immediately; gated personas decide
