@@ -83,6 +83,23 @@ export function routeActivation({ conversation = {}, message = {}, agents = [], 
   }
 }
 
+// The couple room is a separate product surface from legacy persona groups.
+// Human-to-human messages are always stored but never summon an AI unless the
+// user explicitly mentions Bird or replies to a Bird bubble.
+export function routeCoupleActivation({ message = {}, replyTo = null }) {
+  const mention = parseMention(message.text, [])
+  const mentionedBird = mention.type === 'bird'
+  const repliedToBird = replyTo?.agentRole === 'bird' || replyTo?.agentId === 'bird'
+  const shouldReply = mentionedBird || repliedToBird
+
+  return {
+    triggerType: mentionedBird ? 'mention_bird' : repliedToBird ? 'reply_bird' : 'couple_message',
+    isPersonalRecord: false,
+    ambient: false,
+    targets: shouldReply ? [{ agentRole: 'bird', agentId: 'bird' }] : []
+  }
+}
+
 // A quoted bubble becomes a forced reply target only when it belongs to an
 // agent. Quoting the user's own message returns null (routing follows the text).
 function resolveQuotedTarget(replyTo) {

@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { authenticateUser } from '../middleware/auth.js'
 import { supabaseAdmin } from '../lib/supabaseAdmin.js'
-import { routeActivation } from '../lib/chirp/activationRouter.js'
+import { routeActivation, routeCoupleActivation } from '../lib/chirp/activationRouter.js'
 import { runBird } from '../lib/chirp/birdRuntime.js'
 import { CONTEXT_TURNS, classifyReply, runPersona, splitBubbles, takeLastTurns } from '../lib/chirp/personaRuntime.js'
 import { buildMemoryScope, resolveMemoryScope } from '../lib/chirp/memoryScope.js'
@@ -508,19 +508,18 @@ async function prepareTurn({ ownerId, body }) {
         agents,
         replyTo
     })
-    // A couple group is a two-human chat: a no-@ message there is said TO the
-    // partner, never a single-user "personal record". Router untouched — the
-    // flag is corrected on the couple path only.
+    // Couple rooms have a stricter activation contract than legacy persona
+    // groups: ordinary messages are human-to-human; only @bird/reply Bird runs AI.
     if (planetType === 'couple') {
-        activation = { ...activation, isPersonalRecord: false }
+        activation = routeCoupleActivation({
+            message: { type: 'user', text: batch.join('\n'), read: true },
+            replyTo
+        })
     }
 
     const quotedContext = await loadQuotedContext({ conversationId, replyTo })
 
-    // couple v0: Bird replies to every user turn (no @ needed), so a couple
-    // turn always runs a visible agent even though the router leaves targets
-    // empty (router untouched — the handlers' couple branch runs Bird).
-    const visibleRunLock = (activation.targets.length || planetType === 'couple')
+    const visibleRunLock = activation.targets.length
         ? await acquireVisibleRunLock({
             supabase: supabaseAdmin,
             ownerId,
@@ -703,28 +702,28 @@ router.post('/chirp/turn', authenticateUser, async (req, res) => {
         const turn = await prepareTurn({ ownerId: req.user.id, body: req.body })
         visibleRunLock = turn.visibleRunLock
 
-        // couple group v0: Bird replies to every turn directly (single or both
-        // partners present — no @ needed). One bird run per turn; personas never
-        // activate here. Perception is skipped on this path: runBird has no
-        // perception input today (it only shapes persona replies), so computing
-        // it would be a dead model call. Memory boundary: planetType='couple'
-        // narrows bird's scope to THIS conversation (couple_group_bird).
+        // Couple rooms never run persona gates. Ordinary partner messages are
+        // stored and returned with zero model calls; @bird/reply Bird runs one
+        // Bird with memory narrowed to this shared conversation.
         if (turn.planetType === 'couple') {
-            const result = await executeTargetRun({
-                ownerId: req.user.id,
-                conversationId: turn.conversationId,
-                planetId: turn.planetId,
-                conversationType: turn.conversationType,
-                planetType: turn.planetType,
-                target: { agentRole: 'bird', agentId: 'bird' },
-                triggerType: 'couple_group_bird',
-                planet: turn.planet,
-                user: turn.user,
-                members: turn.members,
-                quotedContext: turn.quotedContext,
-                currentUserText: turn.currentUserText,
-                currentMessageIds: turn.currentMessageIds
-            })
+            const birdTarget = turn.activation.targets.find(target => target.agentRole === 'bird')
+            const result = birdTarget
+                ? await executeTargetRun({
+                    ownerId: req.user.id,
+                    conversationId: turn.conversationId,
+                    planetId: turn.planetId,
+                    conversationType: turn.conversationType,
+                    planetType: turn.planetType,
+                    target: birdTarget,
+                    triggerType: turn.activation.triggerType,
+                    planet: turn.planet,
+                    user: turn.user,
+                    members: turn.members,
+                    quotedContext: turn.quotedContext,
+                    currentUserText: turn.currentUserText,
+                    currentMessageIds: turn.currentMessageIds
+                })
+                : null
             const agentMessages = (result && classifyReply(result.reply) !== 'silence')
                 ? await saveAgentReply({
                     planetId: turn.planetId,
@@ -905,7 +904,7 @@ router.post('/chirp/turn/stream', authenticateUser, async (req, res) => {
                     conversationType: turn.conversationType,
                     planetType: turn.planetType,
                     target,
-                    triggerType: isCoupleGroup ? 'couple_group_bird' : turn.activation.triggerType,
+                    triggerType: turn.activation.triggerType,
                     planet: turn.planet,
                     user: turn.user,
                     members: turn.members,
@@ -939,13 +938,13 @@ router.post('/chirp/turn/stream', authenticateUser, async (req, res) => {
             }
         }
 
-        // couple group v0: Bird replies to every turn directly (single or both
-        // partners — no @ needed); personas never activate here. Exactly one
-        // bird run, streamed with the SAME event sequence any agent uses
-        // (agent_started / agent_delta / agent_finished / agent_message,
-        // agent_error on failure) — no new event types.
+        // Couple rooms bypass persona gates. Only explicit Bird activation runs
+        // a model; ordinary partner messages still emit user_messages + done.
         if (isCoupleGroup) {
-            const coupleRun = await streamTarget({ target: { agentRole: 'bird', agentId: 'bird' }, mode: 'mentioned' }, 0)
+            const birdTarget = turn.activation.targets.find(target => target.agentRole === 'bird')
+            const coupleRun = birdTarget
+                ? await streamTarget({ target: birdTarget, mode: 'mentioned' }, 0)
+                : null
 
             // couple has exactly ONE agent: if that run failed the whole turn
             // failed — report it as a top-level `error` event (the client's

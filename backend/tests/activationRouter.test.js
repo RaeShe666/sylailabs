@@ -1,6 +1,6 @@
 ﻿import assert from 'node:assert/strict'
 import test from 'node:test'
-import { parseMention, routeActivation } from '../lib/chirp/activationRouter.js'
+import { parseMention, routeActivation, routeCoupleActivation } from '../lib/chirp/activationRouter.js'
 
 const agents = [
   { id: 'danzong', name: '诞总' },
@@ -198,6 +198,43 @@ test('DM conversations do not require mentions', () => {
       triggerType: 'persona_dm',
       isPersonalRecord: false,
       targets: [{ agentRole: 'persona', agentId: 'danzong' }]
+    }
+  )
+})
+
+test('couple message without @bird stays human-to-human and never activates AI', () => {
+  assert.deepEqual(
+    routeCoupleActivation({ message: { text: '周末我们去哪里？' } }),
+    {
+      triggerType: 'couple_message',
+      isPersonalRecord: false,
+      ambient: false,
+      targets: []
+    }
+  )
+})
+
+test('couple room activates Bird only for @bird or a reply to Bird', () => {
+  assert.deepEqual(
+    routeCoupleActivation({ message: { text: '@bird 帮我们理一下' } }),
+    {
+      triggerType: 'mention_bird',
+      isPersonalRecord: false,
+      ambient: false,
+      targets: [{ agentRole: 'bird', agentId: 'bird' }]
+    }
+  )
+
+  assert.deepEqual(
+    routeCoupleActivation({
+      message: { text: '继续说' },
+      replyTo: { agentRole: 'bird', agentId: 'bird' }
+    }),
+    {
+      triggerType: 'reply_bird',
+      isPersonalRecord: false,
+      ambient: false,
+      targets: [{ agentRole: 'bird', agentId: 'bird' }]
     }
   )
 })
